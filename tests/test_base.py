@@ -1,5 +1,5 @@
-from project_name.base import NAME
+from asr_merging.base import NAME
 
 
 def test_base():
-    assert NAME == "project_name"
+    assert NAME == "asr_merging"
