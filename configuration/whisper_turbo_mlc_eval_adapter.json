@@ -1,0 +1,16 @@
+{
+  "source": "mlc",
+  "model_mode": "adapter",
+  "adapter_path": "experiments/my_whisper_turbo_adapter/checkpoint-1000",
+  "do_eval": true,
+  "evaluation_set": "test_clean",
+  "whisper_language": "english",
+  "whisper_task": "transcribe",
+  "timestamped_exp_dir": true,
+  "experiment_name": "whisper_turbo_mlc_adapter_eval",
+  "output_root": "experiments",
+  "eval_batch_size": 8,
+  "max_new_tokens": 256,
+  "model_id": "openai/whisper-large-v3-turbo",
+  "mlc_cache_dir": "data/cache/whisper"
+}

@@ -1,0 +1,15 @@
+{
+  "source": "mlc",
+  "model_mode": "adapter",
+  "adapter_path": "experiments/my_seamless_adapter/checkpoint-1000",
+  "do_eval": true,
+  "evaluation_set": "test_clean",
+  "target_lang": "eng",
+  "timestamped_exp_dir": true,
+  "experiment_name": "seamless_mlc_adapter_eval",
+  "output_root": "experiments",
+  "eval_batch_size": 8,
+  "max_new_tokens": 256,
+  "model_id": "facebook/seamless-m4t-v2-large",
+  "mlc_cache_dir": "cache"
+}
