@@ -1,5 +1,28 @@
-# This template is a low-dependency template. 
-# By default there is no requirements added here.
-# Add the requirements you need to this file.
-# or run `make init` to create this file automatically based on the template.
-# You can also run `make switch-to-poetry` to use the poetry package manager.
+# Core training/evaluation stack
+torch>=2.10.0
+torchcodec>=0.10.0
+transformers>=5.5.0
+peft>=0.18.1
+bitsandbytes>=0.49.2
+datasets>=4.6.0
+huggingface-hub>=0.34.0
+accelerate>=1.12.0
+tiktoken>=0.12.0
+sentencepiece>=0.2.1
+jiwer>=4.0.0
+torchmetrics>=1.8.2
+numpy>=2.3.5
+pandas>=3.0.1
+tqdm>=4.67.3
+tensorboard>=2.20.0
+matplotlib>=3.10.8
+silero-vad>=6.2.1
+
+# Notebook and interactive analysis extras
+ipywidgets>=8.1.8
+soundfile>=0.13.1
+librosa>=0.10.2
+
+# Optional text normalization/hallucination cleanup helpers used in some notebooks
+num2words>=0.5.14
+pyahocorasick>=2.3.0
