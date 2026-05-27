@@ -1,0 +1,31 @@
+{
+  "source": "mlc",
+  "language": null,
+  "splits": [
+    "dev",
+    "test"
+  ],
+  "checkpoint_path": "experiments/mlc_train_eval_29k_20260406_224234/final_model/",
+  "model_id": "mistralai/Voxtral-Mini-3B-2507",
+  "prompt_language": "en",
+  "decoding_language_mode": "fixed",
+  "scoring_mode": "normalization_both_sides",
+  "enable_mlc_language_name_mapping": true,
+  "eval_batch_size": 32,
+  "max_new_tokens": 256,
+  "max_samples_per_split": null,
+  "prepare_cache": false,
+  "prepare_cache_only": false,
+  "cache_dir": null,
+  "cache_shard_size": 50000,
+  "force_recache": false,
+  "use_prepared_cache": true,
+  "use_bf16": true,
+  "use_fp16": false,
+  "dataloader_num_workers": 4,
+  "output_dir": "experiments/voxtral_eval",
+  "timestamped_output": true,
+  "processed_cv_cache_dir": null,
+  "openslr_cache_dir": null,
+  "mlc_cache_dir": null
+}
