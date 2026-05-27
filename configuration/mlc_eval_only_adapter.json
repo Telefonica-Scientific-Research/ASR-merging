@@ -8,10 +8,12 @@
   "experiment_name": "mlc_adapter_eval",
   "output_root": "experiments",
   "tf_tracking": false,
-  "eval_batch_size": 4,
+  "eval_batch_size": 8,
   "max_new_tokens": 256,
   "use_vad": true,
   "model_id": "mistralai/Voxtral-Mini-3B-2507",
   "prompt_language": "en",
+  "enable_mlc_language_name_mapping": true,
+  "eval_decoding_language_mode": "autodetect", // oracle for using language tags in decoding, "fixed" for using prompt_language for all samples 
   "mlc_cache_dir": "data/cache/voxtral"
 }
