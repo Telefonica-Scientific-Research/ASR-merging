@@ -212,12 +212,136 @@ Disable VAD filtering in the preprocessing path.
 - `--num-epochs`, `--train-batch-size`, `--eval-batch-size`, `--grad-accum-steps`, `--learning-rate`, `--weight-decay`
 Training knobs equivalent to notebook-style configuration.
 
+### Multilingual Language Controls (Train/Eval)
+
+The router now supports per-sample language prompting and language dropout during training.
+
+Config fields (set in `--config-json`):
+- `prompt_language`:
+  Default fallback prompt language when sample-level language is unavailable.
+- `enable_per_sample_language_prompt`:
+  `true|false`. If `true`, collator uses per-sample language fields when present (`language`, `lang`, `lang_code`, `language_code`, `locale`).
+- `language_dropout_fraction`:
+  Float in `[0,1]`. Fraction of training samples where forced language is omitted (auto-detect style) to improve unknown-language robustness.
+- `language_dropout_seed`:
+  RNG seed for language dropout sampling in training.
+- `enable_mlc_language_name_mapping`:
+  `true|false`. Maps MLC names (`english`, `japanese`, `thai`, etc.) to codes (`en`, `ja`, `th`) for model prompting.
+- `eval_decoding_language_mode`:
+  `fixed|oracle|autodetect` for eval in `voxtral_train_router.py`.
+
+Recommended multilingual training setup:
+- `enable_per_sample_language_prompt=true`
+- `language_dropout_fraction=0.1` (start point; tune between `0.05` and `0.2`)
+- `enable_mlc_language_name_mapping=true`
+
 ## 6) Outputs
 
 The script writes outputs under the resolved experiment folder:
 - `experiment_config.json` with CLI/config/split metadata
 - `input_config.json` copy of the JSON config used for this run (if `--config-json` was provided)
 - training artifacts under `final_model/` (when `--do-train`)
+
+## 7) Standalone Evaluation Script (Checkpoint or Base Model)
+
+Use `asr_merging/voxtral_eval_router.py` when you only want evaluation (no training).
+
+### Evaluate base/original model on MLC dev + test
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --source mlc \
+  --splits dev test \
+  --timestamped-output
+```
+
+### Evaluate adapter/checkpoint from an experiment folder on MLC dev + test
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --source mlc \
+  --splits dev test \
+  --checkpoint-path experiments/mlc_train_eval_29k_20260406_224234 \
+  --timestamped-output
+```
+
+Small JSON template for this setup:
+- `configuration/voxtral_eval_mlc_dev_test_template.json`
+
+Run directly from JSON template:
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --config-json configuration/voxtral_eval_mlc_dev_test_template.json
+```
+
+Eval-specific multilingual controls (JSON/CLI):
+- `decoding_language_mode`:
+  - `fixed`: one language for all samples (uses `prompt_language`)
+  - `oracle`: uses per-sample language labels from dataset columns (upper-bound analysis)
+  - `autodetect`: omits forced language and lets Voxtral detect language
+- `scoring_mode`:
+  - `legacy`: plain `jiwer.wer`/`jiwer.cer` on raw refs/preds
+  - `normalization`: notebook-aligned normalization policy
+  - `normalization_both_sides`: applies the normalization policy to both references and predictions
+- `enable_mlc_language_name_mapping`:
+  Maps MLC language names to ISO-like codes for decoding/scoring.
+
+Suggested reproducible comparisons:
+- Keep `scoring_mode=legacy` while validating decode-mode changes.
+- Compare `decoding_language_mode=oracle` vs `decoding_language_mode=autodetect` side-by-side.
+
+Override one value from CLI (CLI takes priority over JSON):
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --config-json configuration/voxtral_eval_mlc_dev_test_template.json \
+  --checkpoint-path experiments/mlc_train_eval_29k_20260406_224234/checkpoint-1000
+```
+
+If evaluation is slow and you want a quick sanity check first:
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --config-json configuration/voxtral_eval_mlc_dev_test_template.json \
+  --max-samples-per-split 200
+```
+
+Prepare sharded eval cache once (faster startup on later eval runs):
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --config-json configuration/voxtral_eval_mlc_dev_test_template.json \
+  --prepare-cache-only
+```
+
+Optional cache controls:
+- `--cache-dir <path>` custom cache root (default: `data/cache/voxtral_eval_shards/<source>/<language-or-all>`)
+- `--cache-shard-size <int>` samples per shard (default: `50000`)
+- `--force-recache` rebuild existing prepared shards
+
+After cache is prepared, normal eval automatically reuses it:
+
+```bash
+python -m asr_merging.voxtral_eval_router \
+  --config-json configuration/voxtral_eval_mlc_dev_test_template.json
+```
+
+Notes:
+- `--checkpoint-path` accepts:
+  - adapter/checkpoint directory containing `adapter_config.json`
+  - experiment directory with `final_model/adapter_config.json`
+  - experiment directory with `checkpoint-*/adapter_config.json` (latest is selected)
+- Metrics are written to `eval_metrics.json` in the resolved output directory.
+
+Equivalent wrapper command via top-level CLI:
+
+```bash
+python -m asr_merging voxtral-eval -- \
+  --source mlc \
+  --splits dev test \
+  --checkpoint-path experiments/mlc_train_eval_29k_20260406_224234
+```
 - evaluation metrics in `eval_metrics.json` (when evaluation runs)
 - TensorBoard logs under `tensorboard/` (when `--tf-tracking` is enabled)
 

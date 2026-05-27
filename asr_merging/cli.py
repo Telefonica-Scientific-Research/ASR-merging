@@ -15,7 +15,8 @@ def main() -> None:  # pragma: no cover
         epilog=(
             "Quick start:\n"
             "  python -m asr_merging whisper-turbo-router -- --config-json configuration/whisper_turbo_mlc_train_eval_baseline.json\n"
-            "  python -m asr_merging seamless-router -- --config-json configuration/seamless_mlc_train_eval_baseline.json"
+            "  python -m asr_merging seamless-router -- --config-json configuration/seamless_mlc_train_eval_baseline.json\n"
+            "  python -m asr_merging voxtral-eval -- --source mlc --splits dev test --checkpoint-path experiments/mlc_train_eval_29k_20260406_224234"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -41,6 +42,17 @@ def main() -> None:  # pragma: no cover
         "router_args",
         nargs=argparse.REMAINDER,
         help="Arguments forwarded to whisper_turbo_train_router (prefix with --).",
+    )
+
+    voxtral_eval = subparsers.add_parser(
+        "voxtral-eval",
+        help="Run the Voxtral evaluation router.",
+        description="Pass-through wrapper for asr_merging.voxtral_eval_router",
+    )
+    voxtral_eval.add_argument(
+        "router_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to voxtral_eval_router (prefix with --).",
     )
 
     args = parser.parse_args()
@@ -71,6 +83,21 @@ def main() -> None:  # pragma: no cover
         try:
             sys.argv = ["whisper_turbo_train_router"] + forwarded
             whisper_turbo_train_router.main()
+        finally:
+            sys.argv = original_argv
+        return
+
+    if args.command == "voxtral-eval":
+        from . import voxtral_eval_router
+
+        forwarded = list(args.router_args or [])
+        if forwarded and forwarded[0] == "--":
+            forwarded = forwarded[1:]
+
+        original_argv = sys.argv
+        try:
+            sys.argv = ["voxtral_eval_router"] + forwarded
+            voxtral_eval_router.main()
         finally:
             sys.argv = original_argv
         return
