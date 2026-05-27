@@ -132,3 +132,8 @@ dmypy.json
 .github/templates/*
 
 .idea/*
+
+# Local experiment outputs (models, checkpoints, eval runs)
+experiments/
+notebooks/experiments/
+notebooks/runs/
