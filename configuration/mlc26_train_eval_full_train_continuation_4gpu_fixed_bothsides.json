@@ -1,0 +1,57 @@
+{
+  "source": "mlc",
+  "model_mode": "adapter",
+  "adapter_path": "experiments/mlc_train_eval_29k_20260406_224234/final_model",
+
+  "do_train": true,
+  "do_eval": true,
+  "train_set": "train",
+  "valid_set": "dev",
+  "evaluation_set": "test_clean",
+
+  "mlc_cache_dir": "data/cache/voxtral",
+  "mlc_train_dev_cache_names": [
+    "mlc_slm_English_French_German_Italian_Japanese_Korean_Portuguese_Russian_Spanish_Thai_Vietnamese_tn",
+    "mlc_slm_zz_2026_new_only_segmented"
+  ],
+  "mlc_test_cache_name": "mlc_slm_English_French_German_Italian_Japanese_Korean_Portuguese_Russian_Spanish_Thai_Vietnamese_tn",
+
+  "timestamped_exp_dir": true,
+  "output_root": "experiments",
+  "experiment_name": "mlc25_mlc26_continue_4gpu_fixed_bothsides",
+  "tf_tracking": true,
+
+  "num_epochs": 1,
+  "train_batch_size": 2,
+  "eval_batch_size": 8,
+  "grad_accum_steps": 2,
+  "learning_rate": 1.5e-5,
+  "weight_decay": 0.01,
+  "logging_steps": 50,
+  "save_steps": 10000,
+  "eval_steps": 10000,
+  "early_stopping_patience": 2,
+  "use_bf16": true,
+  "use_fp16": false,
+  "warmup_ratio": 0.05,
+
+  "adaptive_sampling_enabled": true,
+  "adaptive_sampling_languages": [
+    "french(canada)",
+    "portuguese(brazil)",
+    "spanish(mexico)",
+    "tagalog",
+    "turkish",
+    "urdu"
+  ],
+  "adaptive_sampling_multiplier": 1.5,
+  "adaptive_sampling_stage1_fraction": 0.25,
+  "adaptive_sampling_seed": 42,
+
+  "prompt_language": "en",
+  "enable_per_sample_language_prompt": true,
+  "language_dropout_fraction": 1.0,
+  "use_vad": true,
+  "eval_decoding_language_mode": "fixed",
+  "eval_scoring_mode": "normalization_both_sides"
+}
