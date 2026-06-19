@@ -168,6 +168,129 @@ def _resolve_jsonl_audio_path(raw_path: str, audio_root: Optional[str]) -> str:
     return str(p.resolve())
 
 
+def _normalize_submission_session_id(raw: str) -> str:
+    s = (raw or "").strip()
+    s = s.replace("/", "_")
+    s = s.replace("(", "_").replace(")", "_")
+    s = re.sub(r"__+", "_", s)
+    return s.strip("_")
+
+
+def _session_id_from_audio_path(audio_path: str) -> str:
+    p = Path(audio_path)
+    stem = p.stem
+    parts = list(p.parts)
+
+    # Heuristic: use path segments after a "data" directory when present.
+    rel = parts
+    if "data" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("data")
+        rel = parts[idx + 1 :]
+    if len(rel) >= 2:
+        rel_dirs = rel[:-1]
+    else:
+        rel_dirs = parts[:-1]
+
+    # Common multilingual folder mappings.
+    if len(rel_dirs) >= 2 and rel_dirs[-2] == "English":
+        sub = rel_dirs[-1]
+        if sub in {"American", "Australian", "British", "Filipino", "Indian"}:
+            return f"English_{sub}_{stem}"
+
+    if len(rel_dirs) >= 1:
+        last = rel_dirs[-1]
+        if last == "French(Canada)":
+            return f"French_Canada_{stem}"
+        if last == "Portuguese(Brazil)":
+            return f"Portuguese_Brazil_{stem}"
+        if last == "Spanish(Mexico)":
+            return f"Spanish_Mexico_{stem}"
+
+    # Generic fallback for single-language directories (e.g., Thai/xxx.wav).
+    if len(rel_dirs) >= 1:
+        return f"{_normalize_submission_session_id(rel_dirs[-1])}_{stem}"
+    return stem
+
+
+def _build_audio_index(audio_root: Optional[str]) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    by_session: Dict[str, str] = {}
+    by_stem: Dict[str, List[str]] = defaultdict(list)
+
+    if not audio_root:
+        return by_session, by_stem
+
+    root = Path(audio_root)
+    if not root.exists():
+        return by_session, by_stem
+
+    exts = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
+    for fp in root.rglob("*"):
+        if not fp.is_file() or fp.suffix.lower() not in exts:
+            continue
+        resolved = str(fp.resolve())
+        sid = _normalize_submission_session_id(_session_id_from_audio_path(resolved))
+        by_session.setdefault(sid, resolved)
+        by_stem[fp.stem].append(resolved)
+    return by_session, by_stem
+
+
+def _relative_audio_paths_from_session_id(session_id: str) -> List[str]:
+    sid = _normalize_submission_session_id(session_id)
+    if not sid:
+        return []
+    parts = sid.split("_")
+    if len(parts) < 2:
+        return []
+
+    # Session-id schema is language-prefix + audio stem, where language-prefix
+    # can be one token (e.g., French) or two tokens (e.g., English_British).
+    two_token_langs = {
+        ("English", "American"),
+        ("English", "Australian"),
+        ("English", "British"),
+        ("English", "Filipino"),
+        ("English", "Indian"),
+        ("French", "Canada"),
+        ("Portuguese", "Brazil"),
+        ("Spanish", "Mexico"),
+    }
+
+    prefix_len = 2 if len(parts) >= 2 and (parts[0], parts[1]) in two_token_langs else 1
+    stem_parts = parts[prefix_len:]
+    if not stem_parts:
+        return []
+    stem = "_".join(stem_parts)
+    lang = parts[0]
+
+    if sid.startswith("English_American_"):
+        return [f"English/American/{stem}.wav"]
+    if sid.startswith("English_Australian_"):
+        return [f"English/Australian/{stem}.wav"]
+    if sid.startswith("English_British_"):
+        return [f"English/British/{stem}.wav"]
+    if sid.startswith("English_Filipino_"):
+        return [f"English/Filipino/{stem}.wav"]
+    if sid.startswith("English_Indian_"):
+        return [f"English/Indian/{stem}.wav"]
+    if sid.startswith("French_Canada_"):
+        return [
+            f"French(Canada)/{stem}.wav",
+            f"French_Canada/{stem}.wav",
+        ]
+    if sid.startswith("Portuguese_Brazil_"):
+        return [
+            f"Portuguese(Brazil)/{stem}.wav",
+            f"Portuguese_Brazil/{stem}.wav",
+        ]
+    if sid.startswith("Spanish_Mexico_"):
+        return [
+            f"Spanish(Mexico)/{stem}.wav",
+            f"Spanish_Mexico/{stem}.wav",
+        ]
+
+    return [f"{lang}/{stem}.wav"]
+
+
 def _extract_audio_path_from_row(row: Dict) -> Optional[str]:
     audio = row.get("audio")
 
@@ -573,6 +696,7 @@ def _build_jsonl_audio_mc_task(
     jsonl_path: Optional[str],
     audio_root: Optional[str],
     max_questions_per_audio: int,
+    prediction_only: bool,
 ) -> TaskData:
     del cache_dir  # Unused but kept for a common task-builder signature style.
 
@@ -585,6 +709,7 @@ def _build_jsonl_audio_mc_task(
 
     samples: List[EvalSample] = []
     all_labels = set()
+    audio_by_session, audio_by_stem = _build_audio_index(audio_root)
 
     with src.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -594,16 +719,54 @@ def _build_jsonl_audio_mc_task(
 
             row = json.loads(line)
             raw_audio_path = str(row.get("path") or row.get("audio_path") or "").strip()
-            if not raw_audio_path:
-                continue
-            audio_path = _resolve_jsonl_audio_path(raw_audio_path, audio_root)
 
-            questions = row.get("questions") or []
-            if not isinstance(questions, list):
-                continue
+            # Supported schema A (grouped): one audio row with "questions": [...]
+            # Supported schema B (challenge): one question per row with session_id/question_stem/options.
+            if isinstance(row.get("questions"), list):
+                questions = row.get("questions") or []
+                if not raw_audio_path:
+                    continue
+            else:
+                q_single = {
+                    "question_stem": row.get("question_stem"),
+                    "options": row.get("options"),
+                    "correct_answer": row.get("correct_answer"),
+                    "question_id": row.get("question_id"),
+                }
+                questions = [q_single]
+
+                sess_raw = _normalize_submission_session_id(str(row.get("session_id") or "").strip())
+                if raw_audio_path:
+                    pass
+                elif sess_raw:
+                    if sess_raw in audio_by_session:
+                        raw_audio_path = audio_by_session[sess_raw]
+                    else:
+                        stem_guess = "_".join(sess_raw.split("_")[-3:])
+                        cands = audio_by_stem.get(stem_guess, [])
+                        if len(cands) == 1:
+                            raw_audio_path = cands[0]
+                        else:
+                            rels = _relative_audio_paths_from_session_id(sess_raw)
+                            for rel in rels:
+                                cand = _resolve_jsonl_audio_path(rel, audio_root)
+                                if Path(cand).exists():
+                                    raw_audio_path = cand
+                                    break
+                            if not raw_audio_path and rels:
+                                raw_audio_path = rels[0]
 
             if max_questions_per_audio > 0:
                 questions = questions[:max_questions_per_audio]
+
+            if not raw_audio_path:
+                continue
+            audio_path = _resolve_jsonl_audio_path(raw_audio_path, audio_root)
+            fixed_session_id = _normalize_submission_session_id(
+                _session_id_from_audio_path(audio_path)
+                if audio_path
+                else str(row.get("session_id") or "")
+            )
 
             for qi, q in enumerate(questions):
                 if not isinstance(q, dict):
@@ -616,7 +779,7 @@ def _build_jsonl_audio_mc_task(
 
                 gold_raw = "" if q.get("correct_answer") is None else str(q.get("correct_answer"))
                 gold_choice = _resolve_correct_choice_dynamic(choice_map, gold_raw)
-                if gold_choice is None:
+                if not prediction_only and gold_choice is None:
                     continue
 
                 choice_lines = [f"{lbl}. {txt}" for lbl, txt in choice_map.items()]
@@ -638,6 +801,7 @@ def _build_jsonl_audio_mc_task(
                             "jsonl_line": line_no,
                             "source_audio_path": raw_audio_path,
                             "question_id": qid,
+                            "session_id": fixed_session_id,
                             "question": question,
                         },
                         prompt_text=prompt,
@@ -647,8 +811,9 @@ def _build_jsonl_audio_mc_task(
                 )
                 all_labels.update(choice_map.keys())
 
-    rng = random.Random(seed)
-    rng.shuffle(samples)
+    if not prediction_only:
+        rng = random.Random(seed)
+        rng.shuffle(samples)
     if max_samples > 0:
         samples = samples[: min(max_samples, len(samples))]
 
@@ -911,6 +1076,7 @@ def _evaluate_task(
     model_id: str,
     max_new_tokens: int,
     temp_audio_dir: Path,
+    prediction_only: bool,
 ) -> Tuple[Dict, List[Dict]]:
     rows: List[Dict] = []
     correct = 0
@@ -936,8 +1102,11 @@ def _evaluate_task(
                     output,
                     list((s.choice_map or {}).keys()),
                 )
+                if prediction_only and pred_choice is None:
+                    labels = list((s.choice_map or {}).keys())
+                    pred_choice = labels[0] if labels else None
                 pred = (s.choice_map or {}).get(pred_choice or "", "")
-                ok = pred_choice == s.gold_choice
+                ok = (pred_choice == s.gold_choice) if (not prediction_only and s.gold_choice is not None) else None
                 row = {
                     "task": task.task_name,
                     "sample_id": s.sample_id,
@@ -949,6 +1118,8 @@ def _evaluate_task(
                     "is_correct": ok,
                     "model_output": output,
                     "response": output,
+                    "session_id": s.metadata.get("session_id"),
+                    "question_id": s.metadata.get("question_id"),
                     "id": s.metadata.get("id"),
                     "question": s.metadata.get("question"),
                     "choice_a": (s.choice_map or {}).get("A", ""),
@@ -966,7 +1137,7 @@ def _evaluate_task(
                 }
             else:
                 pred = _select_predicted_label(output, task.labels)
-                ok = pred == s.gold_label
+                ok = (pred == s.gold_label) if not prediction_only else None
                 row = {
                     "task": task.task_name,
                     "sample_id": s.sample_id,
@@ -977,7 +1148,8 @@ def _evaluate_task(
                     "model_output": output,
                     "metadata": s.metadata,
                 }
-            correct += int(ok)
+            if ok is True:
+                correct += 1
             rows.append(row)
         except Exception as e:  # noqa: BLE001
             skipped += 1
@@ -1007,6 +1179,8 @@ def _evaluate_task(
                         "gold_choice": s.gold_choice,
                         "pred_choice": None,
                         "response": "",
+                        "session_id": s.metadata.get("session_id"),
+                        "question_id": s.metadata.get("question_id"),
                         "id": s.metadata.get("id"),
                         "question": s.metadata.get("question"),
                         "choice_a": (s.choice_map or {}).get("A", ""),
@@ -1025,12 +1199,16 @@ def _evaluate_task(
             rows.append(error_row)
 
         if (idx + 1) % 10 == 0 or (idx + 1) == len(task.samples):
+            denom = max(1, idx + 1 - skipped)
+            acc_so_far = (correct / denom) if not prediction_only else 0.0
             print(
                 f"[{task.task_name}] {idx + 1}/{len(task.samples)} processed | "
-                f"acc_so_far={(correct / max(1, idx + 1 - skipped)):.4f} | skipped={skipped}"
+                f"acc_so_far={acc_so_far:.4f} | skipped={skipped}"
             )
 
     eval_count = max(0, len(task.samples) - skipped)
+    if prediction_only:
+        eval_count = 0
     accuracy = (correct / eval_count) if eval_count > 0 else 0.0
 
     if skipped > 0:
@@ -1113,6 +1291,11 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(use_bf16=True)
 
     p.add_argument("--use-fp16", action="store_true")
+    p.add_argument(
+        "--prediction-only",
+        action="store_true",
+        help="Run inference without requiring gold labels; writes hyp.txt for jsonl_audio_mc.",
+    )
 
     return p.parse_args()
 
@@ -1167,6 +1350,7 @@ def main() -> None:
                     model_id=args.model_id,
                     max_new_tokens=int(args.max_new_tokens),
                     temp_audio_dir=temp_audio_dir,
+                    prediction_only=bool(args.prediction_only),
                 )
                 fold_summaries.append(summary)
                 fold_rows.extend(rows)
@@ -1210,6 +1394,7 @@ def main() -> None:
                 jsonl_path=args.jsonl_path,
                 audio_root=args.audio_root,
                 max_questions_per_audio=max(0, int(args.jsonl_max_questions_per_audio)),
+                prediction_only=bool(args.prediction_only),
             )
             print(
                 f"Starting task={task_data.task_name} split={task_data.split_name} "
@@ -1222,6 +1407,7 @@ def main() -> None:
                 model_id=args.model_id,
                 max_new_tokens=int(args.max_new_tokens),
                 temp_audio_dir=temp_audio_dir,
+                prediction_only=bool(args.prediction_only),
             )
             task_summaries.append(summary)
             detailed_task_summaries.append(summary)
@@ -1246,6 +1432,7 @@ def main() -> None:
             model_id=args.model_id,
             max_new_tokens=int(args.max_new_tokens),
             temp_audio_dir=temp_audio_dir,
+            prediction_only=bool(args.prediction_only),
         )
         task_summaries.append(summary)
         detailed_task_summaries.append(summary)
@@ -1269,6 +1456,7 @@ def main() -> None:
         "audio_root": args.audio_root,
         "jsonl_max_questions_per_audio": int(args.jsonl_max_questions_per_audio),
         "max_new_tokens": int(args.max_new_tokens),
+        "prediction_only": bool(args.prediction_only),
         "macro_accuracy": macro_acc,
         "task_summaries": task_summaries,
         "detailed_task_summaries": detailed_task_summaries,
@@ -1281,6 +1469,18 @@ def main() -> None:
     with rows_path.open("w", encoding="utf-8") as f:
         for row in all_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    hyp_path = output_dir / "hyp.txt"
+    if bool(args.prediction_only) and "jsonl_audio_mc" in tasks:
+        hyp_rows = [r for r in all_rows if r.get("task") == "jsonl_audio_mc"]
+        with hyp_path.open("w", encoding="utf-8") as f:
+            for r in hyp_rows:
+                sid = _normalize_submission_session_id(str(r.get("session_id") or ""))
+                qid = str(r.get("question_id") or "")
+                ans = _normalize_choice_label(str(r.get("pred_choice") or ""))
+                if not ans:
+                    ans = "A"
+                f.write(f"{sid} {qid} {ans}\n")
 
     print("\nEvaluation complete.")
     print(f"Macro accuracy: {macro_acc:.4f}")
@@ -1305,6 +1505,8 @@ def main() -> None:
                 )
     print(f"\nSaved metrics: {metrics_path}")
     print(f"Saved predictions: {rows_path}")
+    if bool(args.prediction_only) and "jsonl_audio_mc" in tasks:
+        print(f"Saved hyp: {hyp_path}")
 
 
 if __name__ == "__main__":
