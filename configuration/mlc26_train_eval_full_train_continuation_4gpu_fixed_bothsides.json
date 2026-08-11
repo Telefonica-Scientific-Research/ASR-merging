@@ -21,8 +21,8 @@
   "experiment_name": "mlc25_mlc26_continue_4gpu_fixed_bothsides",
   "tf_tracking": true,
 
-  "num_epochs": 1,
-  "train_batch_size": 2,
+  "num_epochs": 6,
+  "train_batch_size": 8,
   "eval_batch_size": 8,
   "grad_accum_steps": 2,
   "learning_rate": 1.5e-5,
@@ -33,6 +33,8 @@
   "early_stopping_patience": 2,
   "use_bf16": true,
   "use_fp16": false,
+  "use_grad_checkpoint": true,
+  "dataloader_num_workers": 24,
   "warmup_ratio": 0.05,
 
   "adaptive_sampling_enabled": true,
