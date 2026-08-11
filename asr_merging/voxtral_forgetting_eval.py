@@ -28,17 +28,28 @@ from collections import Counter, defaultdict
 import datetime as dt
 import difflib
 import json
+import os
 import random
 import re
+import sys
+import traceback
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from transformers import VoxtralForConditionalGeneration, VoxtralProcessor
+from asr_merging.voxtral_train_router import (
+    _offline_aware_from_pretrained_kwargs,
+    _resolve_pretrained_source,
+)
+from asr_merging.voxtral_train_MCQ import (
+    _build_audio_source_from_question,
+    _extract_time_ranges_from_text,
+)
 
 try:
     # Fix for environments where default cuBLAS BF16 GEMM path is unstable.
@@ -370,9 +381,10 @@ def _load_model(model_id: str, adapter_path: Optional[str], dtype: torch.dtype):
     # runtime stacks than multi-GPU auto-sharding.
     device_map = {"": 0} if torch.cuda.is_available() else "auto"
     model = VoxtralForConditionalGeneration.from_pretrained(
-        model_id,
+        _resolve_pretrained_source(model_id),
         torch_dtype=dtype,
         device_map=device_map,
+        **_offline_aware_from_pretrained_kwargs(),
     )
     model_mode = "baseline"
     resolved_adapter = None
@@ -697,6 +709,7 @@ def _build_jsonl_audio_mc_task(
     audio_root: Optional[str],
     max_questions_per_audio: int,
     prediction_only: bool,
+    yesno_binary: bool = False,
 ) -> TaskData:
     del cache_dir  # Unused but kept for a common task-builder signature style.
 
@@ -782,9 +795,27 @@ def _build_jsonl_audio_mc_task(
                 if not prediction_only and gold_choice is None:
                     continue
 
+                # Neutral ordinal relabeling for 2-option questions.
+                # Replaces A/B with 1/2 in the prompt and scoring to reduce the
+                # MCQ-specific A-slot positional prior without introducing any
+                # semantic assumption (unlike Yes/No which implies affirmative/negative).
+                # The canonical A/B labels are kept in metadata for reverse mapping.
+                yn_to_orig: Optional[Dict[str, str]] = None
+                orig_choice_map = choice_map
+                if yesno_binary and len(choice_map) == 2:
+                    orig_labels = list(choice_map.keys())
+                    yn_labels = ["1", "2"]
+                    yn_to_orig = {yn: orig for yn, orig in zip(yn_labels, orig_labels)}
+                    choice_map = {yn: choice_map[orig] for yn, orig in yn_to_orig.items()}
+                    if gold_choice is not None:
+                        # Remap gold_choice to the 1/2 label space
+                        orig_to_yn = {v: k for k, v in yn_to_orig.items()}
+                        gold_choice = orig_to_yn.get(gold_choice, gold_choice)
+
                 choice_lines = [f"{lbl}. {txt}" for lbl, txt in choice_map.items()]
                 prompt = (
-                    "Choose the most suitable answer from the options below. "
+                    _MCQ_AUDIO_FOCUS_PREFIX
+                    + "Choose the most suitable answer from the options below. "
                     f"You must respond with only one label from: {', '.join(choice_map.keys())}.\n\n"
                     f"Question: {question}\n\n"
                     + "\n".join(choice_lines)
@@ -803,6 +834,8 @@ def _build_jsonl_audio_mc_task(
                             "question_id": qid,
                             "session_id": fixed_session_id,
                             "question": question,
+                            "yn_to_orig": yn_to_orig,
+                            "orig_choice_map": orig_choice_map if yn_to_orig else None,
                         },
                         prompt_text=prompt,
                         choice_map=choice_map,
@@ -895,6 +928,229 @@ def _select_multiple_choice_option(text: str, options: Sequence[str]) -> Optiona
     return None
 
 
+def _option_label_token_ids(processor, label: str) -> List[int]:
+    """First-token ids the model would emit for an option label (e.g. "A").
+
+    Handles both the bare letter and the space-prefixed sub-word variant that
+    sentencepiece/tekken tokenizers produce at the start of a generated answer.
+    Results are cached because the option labels (A/B/C/D) repeat across every
+    sample within a run.
+    """
+    cache = getattr(_option_label_token_ids, "_cache", None)
+    if cache is None:
+        cache = {}
+        _option_label_token_ids._cache = cache
+    if label in cache:
+        return cache[label]
+
+    tok = getattr(processor, "tokenizer", processor)
+    ids: set = set()
+    for variant in (str(label), " " + str(label)):
+        try:
+            enc = tok.encode(variant, add_special_tokens=False)
+        except TypeError:
+            enc = tok.encode(variant)
+        if enc:
+            ids.add(int(enc[-1]))
+    result = sorted(ids)
+    cache[label] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Audio-focus prefix prepended to ALL MCQ prompts (main questions and ICL shots).
+# Trains/reminds the model to focus on paralinguistic audio cues, not just words.
+# ---------------------------------------------------------------------------
+_MCQ_AUDIO_FOCUS_PREFIX: str = (
+    "Listen carefully to the audio \u2014 the answer depends on how the "
+    "speaker sounds (tone, intonation, pace, voice quality), not just "
+    "the words spoken. "
+)
+
+# ICL few-shot format examples (text-only, no audio).
+# These are prepended as user/assistant turns before the actual audio question
+# when --few-shot-count > 0, showing the model to output a bare letter only.
+#
+# Layout (indices):
+#   [0], [1] — 2-option (A/B only) examples: used when --few-shot-count 2 to
+#               demonstrate the model must pick from {A, B} and not hallucinate C/D.
+#   [2], [3], [4] — 4-option (A/B/C/D) examples: used alone with --few-shot-count 2
+#               if a different slice is selected, or combined via --few-shot-count 4/5.
+# ---------------------------------------------------------------------------
+_ICL_FORMAT_EXAMPLES: List[Tuple[str, str]] = [
+    # --- 2-option examples (slots [0] and [1]) ---
+    (
+        "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B.\n\n"
+        "Question: Are the two voices heard in this conversation the same person or two different speakers?\n\n"
+        "A. The same speaker throughout.\nB. Two distinct speakers.",
+        "B",
+    ),
+    (
+        "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B.\n\n"
+        "Question: Does the speaker sound hesitant or confident when delivering the statement?\n\n"
+        "A. Confident and assertive.\nB. Hesitant and uncertain.",
+        "B",
+    ),
+    # --- 4-option examples (slots [2], [3], [4]) ---
+    (
+        "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: Which term best describes speech delivered at a normal, comfortable speaking rate?\n\n"
+        "A. Unusually rapid\nB. Slightly accelerated\nC. Normal pace\nD. Very slow",
+        "C",
+    ),
+    (
+        "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: What label fits a recording environment with minimal background noise?\n\n"
+        "A. Quiet indoor setting\nB. Noisy outdoor space\nC. Crowded venue\nD. Windy exterior",
+        "A",
+    ),
+    (
+        "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: Which descriptor applies to speech that is clearly articulated and easy to understand?\n\n"
+        "A. Muffled\nB. Intelligible\nC. Distorted\nD. Incoherent",
+        "B",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Multimodal ICL examples (audio-grounded, 30-second clips).
+# Audio filenames are relative to _ICL_MM_AUDIO_DIR (resolved from this file).
+# Layout:
+#   [0-3] — 4-option examples, balanced labels A/B/C/D:
+#            diverse dialects (Australian, British×2, Indian) and topics
+#            (speaker ID, speaking rate, emotion, disfluency).
+#   [4-5] — 2-option examples, balanced labels A/B:
+#            (Australian voice comparison, Indian speaker tracking).
+# When --icl-multimodal is set, 4-opt questions receive examples [0-3] and
+# 2-opt questions receive examples [4-5]; few-shot-count is not used.
+# ---------------------------------------------------------------------------
+_ICL_MM_AUDIO_DIR: str = "data/mlc26_task2/icl_examples"
+_ICL_MULTIMODAL_EXAMPLES: List[Tuple[str, str, str]] = [
+    # fmt: off  (long string literals — keep on one line for readability)
+    # --- 4-option examples (slots [0-3], answers A / B / C / D) ---
+    (
+        "icl_4opt_A_eng_aus.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        'Question: Who speaks the line "They\'re grooming us" at [518.87, 520.22]?\n\n'
+        "A. The speaker who previously owned a cafe.\n"
+        "B. The speaker who used to be a programmer.\n"
+        "C. Both speakers say it at the same time.\n"
+        "D. It is not clear who the speaker is.",
+        "A",
+    ),
+    (
+        "icl_4opt_B_eng_brit.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: At [43.88, 48.99], the speaker says \'Yes, that\'s okay with me right, what\'s your first\'. "
+        "What does his delivery reveal about his attitude?\n\n"
+        "A. He speaks very slowly and hesitantly, showing reluctance.\n"
+        "B. His quick pace and eager tone after agreeing show he is keen to continue.\n"
+        "C. He laughs, indicating he thinks the topic is funny.\n"
+        "D. He sighs, showing he is bored with the topic already.",
+        "B",
+    ),
+    (
+        "icl_4opt_C_eng_brit.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: How does the speaker at [365.75, 372.42] sound when he says \'Really. Wow\' "
+        "in reaction to something he just heard?\n\n"
+        "A. Excited and curious.\n"
+        "B. Calm and indifferent.\n"
+        "C. Shocked and slightly disgusted.\n"
+        "D. Amused and intrigued.",
+        "C",
+    ),
+    (
+        "icl_4opt_D_eng_ind.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: In the phrase \'Uh my just a co - co - college is open\' [641.94, 648.49], "
+        "what do the sounds the speaker makes primarily indicate?\n\n"
+        "A. He is angry.\n"
+        "B. He is excited.\n"
+        "C. He is emphasizing the word \'college\'.\n"
+        "D. He is hesitating or stumbling over his words.",
+        "D",
+    ),
+    # --- 2-option examples (slots [4-5], answers A / B) ---
+    (
+        "icl_2opt_A_eng_aus.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B.\n\n"
+        "Question: In the exchange between [127.92, 130.56], two speakers both say "
+        "\'it does the job\'. Which speaker proposed the phrase first?\n\n"
+        "A. The speaker with the slightly deeper voice who proposed the phrase.\n"
+        "B. The speaker with the slightly higher-pitched voice who agreed with the phrase.",
+        "A",
+    ),
+    (
+        "icl_2opt_B_eng_ind.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B.\n\n"
+        "Question: Between [215.68, 222.71], one speaker asks about the developer of cricket "
+        "and the other admits not knowing. Who asks the question?\n\n"
+        "A. The speaker who advocates for PUBG.\n"
+        "B. The speaker who advocates for cricket.",
+        "B",
+    ),
+]  # fmt: on
+
+# Non-English audio variant: identical to _ICL_MULTIMODAL_EXAMPLES except
+# slot [3] (4-opt-D) uses a Vietnamese audio clip with an English-translated
+# question, teaching the model to answer in English regardless of audio language.
+_ICL_MULTIMODAL_EXAMPLES_NONEN: List[Tuple[str, str, str]] = [
+    _ICL_MULTIMODAL_EXAMPLES[0],  # 4opt-A  English_Australian
+    _ICL_MULTIMODAL_EXAMPLES[1],  # 4opt-B  English_British
+    _ICL_MULTIMODAL_EXAMPLES[2],  # 4opt-C  English_British
+    (                             # 4opt-D  Vietnamese audio + English question
+        "icl_4opt_D_vie.wav",
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        "You must respond with only one label from: A, B, C, D.\n\n"
+        "Question: What emotions are expressed in the word \"H\u1ea3?\" said at [383.54, 383.92]?\n\n"
+        "A. Agreeing and understanding.\n"
+        "B. Joy and excitement.\n"
+        "C. Confusion and hearing difficulty.\n"
+        "D. Shocked and disbelief.",
+        "D",
+    ),
+    _ICL_MULTIMODAL_EXAMPLES[4],  # 2opt-A  English_Australian
+    _ICL_MULTIMODAL_EXAMPLES[5],  # 2opt-B  English_Indian
+]
+
+
+def _render_mc_prompt(question: str, choice_map: Dict[str, str]) -> str:
+    """Rebuild the jsonl_audio_mc core prompt for a given label->text mapping.
+
+    Mirrors the template used in _build_jsonl_audio_mc_task so that
+    option-permutation debiasing presents prompts identical to the canonical
+    eval apart from which content sits at each label slot.
+    """
+    choice_lines = [f"{lbl}. {txt}" for lbl, txt in choice_map.items()]
+    return (
+        _MCQ_AUDIO_FOCUS_PREFIX
+        + "Choose the most suitable answer from the options below. "
+        f"You must respond with only one label from: {', '.join(choice_map.keys())}.\n\n"
+        f"Question: {question}\n\n"
+        + "\n".join(choice_lines)
+    )
+
+
 def _run_audio_instruction(
     model,
     processor,
@@ -903,17 +1159,89 @@ def _run_audio_instruction(
     prompt: str,
     model_id: str,
     max_new_tokens: int,
-) -> str:
+    prompt_prefix: str = "",
+    crop_from_question_refs: bool = False,
+    crop_collar_seconds: float = 30.0,
+    random_crop_seconds: float = 0.0,
+    transcript_dir: Optional[str] = None,
+    transcript_max_words: int = 0,
+    score_labels: Optional[Sequence[str]] = None,
+    few_shot_count: int = 0,
+    icl_multimodal: bool = False,
+    icl_multimodal_nonen: bool = False,
+) -> Union[str, Dict[str, float]]:
     # Preferred audio-instruct path.
-    conversation = [
+    effective_prompt = (prompt_prefix + prompt) if prompt_prefix else prompt
+
+    # Optionally prepend the ASR transcript so the LLM can cross-reference text
+    # with audio when answering the MCQ.
+    transcript = _load_transcript(audio_path, transcript_dir, transcript_max_words)
+    if transcript:
+        effective_prompt = f"Transcript:\n{transcript}\n\n{effective_prompt}"
+
+    # Eval-time audio cropping (opt-in via crop_from_question_refs=True).
+    # Uses the question/prompt text for timestamp detection.
+    # Questions without detected timestamps pass full audio (random_crop_seconds=0).
+    if crop_from_question_refs:
+        crop_audio_source, _crop_key, _allow_cache, _crop_windows = _build_audio_source_from_question(
+            audio_path=audio_path,
+            question_text=sample.prompt_text or prompt,
+            sample_id=sample.sample_id,
+            crop_from_question_refs=True,
+            crop_collar_seconds=crop_collar_seconds,
+            random_crop_seconds=random_crop_seconds,
+        )
+        if isinstance(crop_audio_source, np.ndarray):
+            # processor.apply_chat_template requires a file path for audio;
+            # save the cropped ndarray to a system temp file (NOT the audio
+            # parent dir — that would pollute the dataset with tmp*_crop.wav files).
+            import tempfile as _tempfile
+            _crop_tmp_fd, _crop_tmp_str = _tempfile.mkstemp(suffix="_crop.wav")
+            os.close(_crop_tmp_fd)
+            _crop_tmp = Path(_crop_tmp_str)
+            _write_wav_from_samples(_crop_tmp, crop_audio_source, 16000)
+            audio_content: Dict = {"type": "audio", "path": str(_crop_tmp)}
+        else:
+            _crop_tmp = None
+            audio_content = {"type": "audio", "path": str(crop_audio_source)}
+    else:
+        audio_content = {"type": "audio", "path": audio_path}
+
+    conversation = []
+    # Prepend ICL examples (text-only or multimodal) to teach the model to output a bare letter.
+    if icl_multimodal and few_shot_count > 0:
+        _icl_base = _ICL_MULTIMODAL_EXAMPLES_NONEN if icl_multimodal_nonen else _ICL_MULTIMODAL_EXAMPLES
+        _n_opts = len(sample.choice_map or {})
+        if few_shot_count >= len(_icl_base):
+            # Type-adaptive: use 2-opt pool for 2-opt questions, 4-opt pool otherwise.
+            _icl_pool = _icl_base[4:6] if _n_opts == 2 else _icl_base[0:4]
+        else:
+            # Non-adaptive: use first few_shot_count examples for all question types.
+            _icl_pool = _icl_base[:few_shot_count]
+        _icl_audio_base = Path(__file__).resolve().parent.parent / _ICL_MM_AUDIO_DIR
+        for _icl_fname, _icl_q, _icl_a in _icl_pool:
+            conversation.append({
+                "role": "user",
+                "content": [
+                    {"type": "audio", "path": str(_icl_audio_base / _icl_fname)},
+                    {"type": "text", "text": _icl_q},
+                ],
+            })
+            conversation.append({"role": "assistant", "content": _icl_a})
+    else:
+        # Text-only ICL examples (legacy).
+        for _icl_q, _icl_a in _ICL_FORMAT_EXAMPLES[:few_shot_count]:
+            conversation.append({"role": "user", "content": _icl_q})
+            conversation.append({"role": "assistant", "content": _icl_a})
+    conversation.append(
         {
             "role": "user",
             "content": [
-                {"type": "audio", "path": audio_path},
-                {"type": "text", "text": prompt},
+                audio_content,
+                {"type": "text", "text": effective_prompt},
             ],
         }
-    ]
+    )
 
     try:
         inputs = processor.apply_chat_template(
@@ -954,6 +1282,31 @@ def _run_audio_instruction(
         }
         inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
+    if score_labels is not None:
+        # Logit-scoring path for option-permutation debiasing.  Instead of
+        # generating free text, read the next-token distribution and return the
+        # log-sum-exp logprob mass for each requested option label.
+        with torch.no_grad():
+            model_out = model(**inputs)
+        next_token_logits = model_out.logits[0, -1, :].float()
+        logprobs = torch.log_softmax(next_token_logits, dim=-1)
+        scores: Dict[str, float] = {}
+        for lbl in score_labels:
+            tok_ids = _option_label_token_ids(processor, str(lbl))
+            if tok_ids:
+                cand = torch.stack([logprobs[t] for t in tok_ids])
+                scores[str(lbl)] = float(torch.logsumexp(cand, dim=0))
+            else:
+                scores[str(lbl)] = float("-inf")
+
+        # Clean up the temporary crop WAV written to the system temp dir.
+        if crop_from_question_refs and "_crop_tmp" in dir() and _crop_tmp is not None:
+            try:
+                _crop_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return scores
+
     with torch.no_grad():
         out = model.generate(
             **inputs,
@@ -963,7 +1316,171 @@ def _run_audio_instruction(
 
     prompt_len = inputs["input_ids"].shape[1]
     decoded = processor.batch_decode(out[:, prompt_len:], skip_special_tokens=True)
+
+    # Clean up the temporary crop WAV written to the system temp dir.
+    if crop_from_question_refs and "_crop_tmp" in dir() and _crop_tmp is not None:
+        try:
+            _crop_tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     return decoded[0] if decoded else ""
+
+
+def _predict_choice_cyclic_debias(
+    model,
+    processor,
+    sample: EvalSample,
+    audio_path: str,
+    model_id: str,
+    prompt_prefix: str = "",
+    crop_from_question_refs: bool = False,
+    crop_collar_seconds: float = 30.0,
+    random_crop_seconds: float = 0.0,
+    transcript_dir: Optional[str] = None,
+    transcript_max_words: int = 0,
+    few_shot_count: int = 0,
+    icl_multimodal: bool = False,
+    icl_multimodal_nonen: bool = False,
+) -> Tuple[Optional[str], Dict[str, float], List[Dict[str, float]]]:
+    """Position-debiased MCQ prediction via cyclic option permutation.
+
+    Each answer content is presented once at every label slot across N cyclic
+    rotations (N = number of options).  For each rotation we read the model's
+    next-token logprobs for the option labels, convert them to a normalized
+    distribution over the slots, and accumulate each rotation's probability back
+    onto the *content* currently occupying that slot.  Averaging across rotations
+    cancels the per-slot prior (e.g. the model's tendency to answer "A"), and the
+    content with the highest mean probability wins.
+
+    Returns (predicted_canonical_label, content_probs_by_label, per_rotation_scores).
+    """
+    choice_map = sample.choice_map or {}
+    labels = list(choice_map.keys())
+    contents = list(choice_map.values())
+    n = len(labels)
+    if n < 2:
+        return (labels[0] if labels else None), {}, []
+
+    question = str((sample.metadata or {}).get("question", "") or "")
+    content_prob = [0.0] * n
+    per_rotation: List[Dict[str, float]] = []
+
+    for r in range(n):
+        # Rotation r: label slot j shows content[(j + r) % n].
+        permuted = {labels[j]: contents[(j + r) % n] for j in range(n)}
+        prompt_r = _render_mc_prompt(question, permuted)
+        scores = _run_audio_instruction(
+            model=model,
+            processor=processor,
+            sample=sample,
+            audio_path=audio_path,
+            prompt=prompt_r,
+            model_id=model_id,
+            max_new_tokens=1,
+            prompt_prefix=prompt_prefix,
+            crop_from_question_refs=crop_from_question_refs,
+            crop_collar_seconds=crop_collar_seconds,
+            random_crop_seconds=random_crop_seconds,
+            transcript_dir=transcript_dir,
+            transcript_max_words=transcript_max_words,
+            score_labels=labels,
+            few_shot_count=few_shot_count,
+            icl_multimodal=icl_multimodal,
+            icl_multimodal_nonen=icl_multimodal_nonen,
+        )
+        per_rotation.append({lbl: float(scores.get(lbl, float("-inf"))) for lbl in labels})
+
+        logp = torch.tensor(
+            [scores.get(lbl, float("-inf")) for lbl in labels],
+            dtype=torch.float32,
+        )
+        prob = torch.softmax(logp, dim=0)
+        for j in range(n):
+            content_prob[(j + r) % n] += float(prob[j]) / n
+
+    best_idx = max(range(n), key=lambda k: content_prob[k])
+    content_probs_by_label = {labels[k]: content_prob[k] for k in range(n)}
+    return labels[best_idx], content_probs_by_label, per_rotation
+
+
+def _predict_choice_calibrated(
+    model,
+    processor,
+    sample: EvalSample,
+    audio_path: str,
+    model_id: str,
+    prompt_prefix: str = "",
+    crop_from_question_refs: bool = False,
+    crop_collar_seconds: float = 30.0,
+    random_crop_seconds: float = 0.0,
+    transcript_dir: Optional[str] = None,
+    transcript_max_words: int = 0,
+    few_shot_count: int = 0,
+    icl_multimodal: bool = False,
+    icl_multimodal_nonen: bool = False,
+) -> Tuple[Optional[str], Dict[str, float], Dict[str, float]]:
+    """Prior-calibrated MCQ prediction (Zhao et al., 2021 — "Calibrate Before Use").
+
+    Scores each label on the *real* prompt and on a *null* prompt that keeps the
+    question and audio unchanged but replaces every option's text with an empty
+    string.  The null prompt reveals the model's label-position prior
+    P(label | question, empty_options) independently of option semantics.
+
+    Calibrated log-score = log P(label | real) − log P(label | null).
+
+    The label with the highest calibrated score is returned.  Unlike cyclic
+    debias, this requires exactly 2 forward passes regardless of N, but it only
+    removes the *prior conditioned on the question* — if the prior varies across
+    questions it is captured per-question.
+
+    Returns (pred_label, calibrated_scores_by_label, null_logprobs_by_label).
+    """
+    choice_map = sample.choice_map or {}
+    labels = list(choice_map.keys())
+    n = len(labels)
+    if n < 2:
+        return (labels[0] if labels else None), {}, {}
+
+    question = str((sample.metadata or {}).get("question", "") or "")
+
+    # Null prompt: same MCQ format but option texts are empty.
+    null_choice_map = {lbl: "" for lbl in labels}
+    null_prompt = _render_mc_prompt(question, null_choice_map)
+
+    # Real prompt: normal MCQ prompt with actual option texts.
+    real_prompt = _render_mc_prompt(question, choice_map)
+
+    shared_kwargs = dict(
+        model=model,
+        processor=processor,
+        sample=sample,
+        audio_path=audio_path,
+        model_id=model_id,
+        max_new_tokens=1,
+        prompt_prefix=prompt_prefix,
+        crop_from_question_refs=crop_from_question_refs,
+        crop_collar_seconds=crop_collar_seconds,
+        random_crop_seconds=random_crop_seconds,
+        transcript_dir=transcript_dir,
+        transcript_max_words=transcript_max_words,
+        score_labels=labels,
+        few_shot_count=few_shot_count,
+        icl_multimodal=icl_multimodal,
+        icl_multimodal_nonen=icl_multimodal_nonen,
+    )
+
+    null_scores: Dict[str, float] = _run_audio_instruction(prompt=null_prompt, **shared_kwargs)
+    real_scores: Dict[str, float] = _run_audio_instruction(prompt=real_prompt, **shared_kwargs)
+
+    # Calibrated score in log-space: log P(real) - log P(null).
+    calibrated = {
+        lbl: real_scores.get(lbl, float("-inf")) - null_scores.get(lbl, float("-inf"))
+        for lbl in labels
+    }
+
+    pred_choice = max(labels, key=lambda l: calibrated[l])
+    return pred_choice, calibrated, {lbl: null_scores.get(lbl, float("-inf")) for lbl in labels}
 
 
 def _build_voxtral_chat_input_features(processor, chat_audio: List[np.ndarray]) -> torch.Tensor:
@@ -1024,6 +1541,74 @@ def _task_builder(task_name: str):
     raise ValueError(f"Unsupported task: {task_name}. Supported tasks: {SUPPORTED_TASKS}")
 
 
+def _load_transcript(audio_path: str, transcript_dir: Optional[str],
+                     max_words: int = 0) -> str:
+    """Load the plain-text transcript for *audio_path* from *transcript_dir*.
+
+    Returns an empty string only when the transcript file is not found or
+    *transcript_dir* is None/empty.
+
+    Hallucination-loop detection: if any 5-gram appears more than 5 times the
+    transcript is treated as corrupted.  The clean tokens before the loop onset
+    are kept and an error notice is appended so the model knows the transcript is
+    unreliable::
+
+        {pre-loop text}
+        [Note: ASR transcription may contain errors]
+
+    When *max_words* > 0 the (possibly truncated) transcript is further limited
+    to that many words (applied before the error notice).
+    """
+    if not transcript_dir:
+        return ""
+    stem = Path(audio_path).stem
+    txt_path = Path(transcript_dir) / f"{stem}.txt"
+    if not txt_path.exists():
+        return ""
+    text = txt_path.read_text(encoding="utf-8").strip()
+    words = text.split()
+    has_errors = False
+    # Hallucination-loop filter: sliding-window density check.
+    # A real loop fills a 150-word window with many repetitions of one 5-gram.
+    # A naturally repeated phrase (e.g. "how about you i am") appears at most
+    # 1-2 times per window and is never flagged.
+    if len(words) >= 6:
+        from collections import Counter
+        _NGRAM, _WIN, _MIN = 5, 150, 5
+        _step = max(1, _WIN // 3)
+        _loop_phrase, _loop_start = None, len(words)
+        for _ws in range(0, max(1, len(words) - _WIN + 1), _step):
+            _ww = words[_ws: _ws + _WIN]
+            _ng = [" ".join(_ww[_i:_i+_NGRAM]) for _i in range(len(_ww)-_NGRAM)]
+            _cnt = Counter(_ng)
+            if not _cnt:
+                continue
+            _top, _c = _cnt.most_common(1)[0]
+            if _c > _MIN:
+                _tp = _top.split()
+                _n = len(_tp)
+                _seen = False
+                for _i in range(len(words) - _n + 1):
+                    if words[_i:_i+_n] == _tp:
+                        if _seen:
+                            _loop_start = _i
+                            break
+                        _seen = True
+                else:
+                    _loop_start = _ws
+                _loop_phrase = _top
+                break
+        if _loop_phrase is not None:
+            has_errors = True
+            words = words[:_loop_start]
+    if max_words > 0 and len(words) > max_words:
+        words = words[:max_words]
+    clean_text = " ".join(words)
+    if has_errors:
+        return (clean_text + "\n[Note: ASR transcription may contain errors]").strip()
+    return clean_text if max_words > 0 else text
+
+
 def _build_prompt_for_sample(task: TaskData, sample: EvalSample) -> str:
     if task.evaluation_mode == "multiple_choice":
         if not sample.prompt_text:
@@ -1077,6 +1662,17 @@ def _evaluate_task(
     max_new_tokens: int,
     temp_audio_dir: Path,
     prediction_only: bool,
+    prompt_prefix: str = "",
+    crop_from_question_refs: bool = False,
+    crop_collar_seconds: float = 30.0,
+    random_crop_seconds: float = 0.0,
+    transcript_dir: Optional[str] = None,
+    transcript_max_words: int = 0,
+    debias_cyclic: bool = False,
+    calibrate_prior: bool = False,
+    few_shot_count: int = 0,
+    icl_multimodal: bool = False,
+    icl_multimodal_nonen: bool = False,
 ) -> Tuple[Dict, List[Dict]]:
     rows: List[Dict] = []
     correct = 0
@@ -1087,46 +1683,105 @@ def _evaluate_task(
     for idx, s in enumerate(task.samples):
         try:
             audio_path = _materialize_audio_path(s, temp_audio_dir)
-            prompt = _build_prompt_for_sample(task, s)
-            output = _run_audio_instruction(
-                model=model,
-                processor=processor,
-                sample=s,
-                audio_path=audio_path,
-                prompt=prompt,
-                model_id=model_id,
-                max_new_tokens=max_new_tokens,
-            )
-            if task.evaluation_mode == "multiple_choice":
-                pred_choice = _select_multiple_choice_option(
-                    output,
-                    list((s.choice_map or {}).keys()),
+            debias_probs: Optional[Dict[str, float]] = None
+            debias_per_rotation: Optional[List[Dict[str, float]]] = None
+            calib_null_logprobs: Optional[Dict[str, float]] = None
+            if calibrate_prior and task.evaluation_mode == "multiple_choice":
+                pred_choice, debias_probs, calib_null_logprobs = _predict_choice_calibrated(
+                    model=model,
+                    processor=processor,
+                    sample=s,
+                    audio_path=audio_path,
+                    model_id=model_id,
+                    prompt_prefix=prompt_prefix,
+                    crop_from_question_refs=crop_from_question_refs,
+                    crop_collar_seconds=crop_collar_seconds,
+                    random_crop_seconds=random_crop_seconds,
+                    transcript_dir=transcript_dir,
+                    transcript_max_words=transcript_max_words,
+                    few_shot_count=few_shot_count,
+                    icl_multimodal=icl_multimodal,
+                    icl_multimodal_nonen=icl_multimodal_nonen,
                 )
+                output = ""
+            elif debias_cyclic and task.evaluation_mode == "multiple_choice":
+                pred_choice, debias_probs, debias_per_rotation = _predict_choice_cyclic_debias(
+                    model=model,
+                    processor=processor,
+                    sample=s,
+                    audio_path=audio_path,
+                    model_id=model_id,
+                    prompt_prefix=prompt_prefix,
+                    crop_from_question_refs=crop_from_question_refs,
+                    crop_collar_seconds=crop_collar_seconds,
+                    random_crop_seconds=random_crop_seconds,
+                    transcript_dir=transcript_dir,
+                    transcript_max_words=transcript_max_words,
+                    few_shot_count=few_shot_count,
+                    icl_multimodal=icl_multimodal,
+                    icl_multimodal_nonen=icl_multimodal_nonen,
+                )
+                output = ""
+            elif not calibrate_prior:
+                prompt = _build_prompt_for_sample(task, s)
+                output = _run_audio_instruction(
+                    model=model,
+                    processor=processor,
+                    sample=s,
+                    audio_path=audio_path,
+                    prompt=prompt,
+                    model_id=model_id,
+                    max_new_tokens=max_new_tokens,
+                    prompt_prefix=prompt_prefix,
+                    crop_from_question_refs=crop_from_question_refs,
+                    crop_collar_seconds=crop_collar_seconds,
+                    random_crop_seconds=random_crop_seconds,
+                    transcript_dir=transcript_dir,
+                    transcript_max_words=transcript_max_words,
+                    few_shot_count=few_shot_count,
+                    icl_multimodal=icl_multimodal,
+                    icl_multimodal_nonen=icl_multimodal_nonen,
+                )
+            if task.evaluation_mode == "multiple_choice":
+                if not debias_cyclic and not calibrate_prior:
+                    pred_choice = _select_multiple_choice_option(
+                        output,
+                        list((s.choice_map or {}).keys()),
+                    )
                 if prediction_only and pred_choice is None:
                     labels = list((s.choice_map or {}).keys())
                     pred_choice = labels[0] if labels else None
                 pred = (s.choice_map or {}).get(pred_choice or "", "")
-                ok = (pred_choice == s.gold_choice) if (not prediction_only and s.gold_choice is not None) else None
+                # Remap Yes/No predictions back to canonical A/B labels.
+                yn_to_orig = (s.metadata or {}).get("yn_to_orig")
+                orig_choice_map = (s.metadata or {}).get("orig_choice_map") or s.choice_map or {}
+                canonical_pred_choice = yn_to_orig.get(pred_choice, pred_choice) if yn_to_orig and pred_choice else pred_choice
+                canonical_gold_choice = yn_to_orig.get(s.gold_choice, s.gold_choice) if yn_to_orig and s.gold_choice else s.gold_choice
+                ok = (canonical_pred_choice == canonical_gold_choice) if (not prediction_only and canonical_gold_choice is not None) else None
                 row = {
                     "task": task.task_name,
                     "sample_id": s.sample_id,
                     "audio_path": audio_path,
                     "gold_label": s.gold_label,
-                    "gold_choice": s.gold_choice,
-                    "pred_label": pred,
-                    "pred_choice": pred_choice,
+                    "gold_choice": canonical_gold_choice,
+                    "pred_label": orig_choice_map.get(canonical_pred_choice or "", pred),
+                    "pred_choice": canonical_pred_choice,
+                    "yn_pred_raw": pred_choice if yn_to_orig else None,
                     "is_correct": ok,
                     "model_output": output,
                     "response": output,
+                    "debias_content_probs": debias_probs,
+                    "debias_per_rotation": debias_per_rotation,
+                    "calib_null_logprobs": calib_null_logprobs,
                     "session_id": s.metadata.get("session_id"),
                     "question_id": s.metadata.get("question_id"),
                     "id": s.metadata.get("id"),
                     "question": s.metadata.get("question"),
-                    "choice_a": (s.choice_map or {}).get("A", ""),
-                    "choice_b": (s.choice_map or {}).get("B", ""),
-                    "choice_c": (s.choice_map or {}).get("C", ""),
-                    "choice_d": (s.choice_map or {}).get("D", ""),
-                    "choices": s.choice_map,
+                    "choice_a": orig_choice_map.get("A", ""),
+                    "choice_b": orig_choice_map.get("B", ""),
+                    "choice_c": orig_choice_map.get("C", ""),
+                    "choice_d": orig_choice_map.get("D", ""),
+                    "choices": orig_choice_map,
                     "answer_gt": s.gold_label,
                     "task_name": s.metadata.get("task_name"),
                     "category": s.metadata.get("category"),
@@ -1155,12 +1810,12 @@ def _evaluate_task(
             skipped += 1
             error_msg = f"{type(e).__name__}: {e}"
             error_counts[error_msg] += 1
-
-            if sum(error_counts.values()) <= max_error_examples:
-                print(
-                    f"[{task.task_name}] skip sample_id={s.sample_id} "
-                    f"reason={error_msg}"
-                )
+            print(
+                f"[{task.task_name}] SKIP sample_id={s.sample_id} reason={error_msg}",
+                file=sys.stderr,
+            )
+            if isinstance(e, (RuntimeError, torch.cuda.OutOfMemoryError)):
+                traceback.print_exc(file=sys.stderr)
 
             error_row = {
                 "task": task.task_name,
@@ -1212,9 +1867,9 @@ def _evaluate_task(
     accuracy = (correct / eval_count) if eval_count > 0 else 0.0
 
     if skipped > 0:
-        print(f"[{task.task_name}] skip summary (top reasons):")
-        for reason, count in error_counts.most_common(8):
-            print(f"[{task.task_name}]   {count}x {reason}")
+        print(f"[{task.task_name}] skip summary (top reasons):", file=sys.stderr)
+        for reason, count in error_counts.most_common():
+            print(f"[{task.task_name}]   {count}x {reason}", file=sys.stderr)
 
     summary = {
         "task": task.task_name,
@@ -1281,6 +1936,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--max-new-tokens", type=int, default=16)
+    p.add_argument(
+        "--few-shot-count",
+        type=int,
+        default=0,
+        help="Number of text-only ICL examples to prepend as user/assistant turns before the "
+             "audio question. Teaches OOTB models to output a bare letter (A/B/C/D). "
+             f"Max {len(_ICL_FORMAT_EXAMPLES)}. Slots [0-1] are 2-option (A/B) examples; "
+             "slots [2-4] are 4-option (A/B/C/D) examples. Default 0 (disabled).",
+    )
+    p.add_argument(
+        "--icl-multimodal",
+        action="store_true",
+        default=False,
+        help="Use multimodal (audio+text) ICL examples from _ICL_MULTIMODAL_EXAMPLES instead of "
+             "text-only examples. When --few-shot-count equals the full pool size (6), selects "
+             "4-opt shots for 4-option questions and 2-opt shots for 2-option questions. "
+             "When --few-shot-count < 6, uses the first N examples for all question types.",
+    )
+    p.add_argument(
+        "--icl-multimodal-nonen",
+        action="store_true",
+        default=False,
+        help="When --icl-multimodal is set, replace the 4-opt-D English slot with a "
+             "Vietnamese audio clip (English-translated question) to demonstrate that "
+             "the model should answer in English regardless of audio language.",
+    )
     p.add_argument("--cache-dir", default=None)
 
     p.add_argument("--output-dir", default="experiments/voxtral_forgetting_eval")
@@ -1297,6 +1978,90 @@ def parse_args() -> argparse.Namespace:
         help="Run inference without requiring gold labels; writes hyp.txt for jsonl_audio_mc.",
     )
 
+    p.add_argument(
+        "--prompt-language",
+        default="en",
+        help="Language tag used in the transcription hint prefix (e.g. 'en', 'fr').  "
+             "Only relevant when --use-transcription-hint-format is set.",
+    )
+    p.add_argument(
+        "--use-transcription-hint-format",
+        action="store_true",
+        help="Prepend 'lang:{lang}\\n[TRANSCRIBE]\\n' to every MCQ question prompt, "
+             "embedding the ASR transcription cue inside the [INST] block.  "
+             "Matches the training format produced by voxtral_train_MCQ.py "
+             "--use-transcription-hint-format.",
+    )
+    p.add_argument(
+        "--eval-crop-from-question-refs",
+        action="store_true",
+        help="Apply timestamp-based audio cropping during inference. "
+             "Questions with detected time references are cropped to the relevant window "
+             "(± --eval-crop-collar-seconds); questions without time references receive "
+             "full audio when --eval-random-crop-seconds=0 (default).",
+    )
+    p.add_argument(
+        "--eval-crop-collar-seconds",
+        type=float,
+        default=30.0,
+        help="Collar in seconds around detected timestamps for eval crop. Default 30.0.",
+    )
+    p.add_argument(
+        "--eval-random-crop-seconds",
+        type=float,
+        default=0.0,
+        help="Fallback crop duration (seconds) for questions without timestamps. "
+             "0 (default) passes full audio for those questions.",
+    )
+    p.add_argument(
+        "--transcript-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory containing ASR transcript .txt files (one per session, named {stem}.txt). "
+             "When set, the full transcript is prepended to every MCQ prompt as "
+             "'Transcript:\\n{text}\\n\\n'. Off by default.",
+    )
+    p.add_argument(
+        "--transcript-max-words",
+        type=int,
+        default=0,
+        help="Truncate transcript to at most this many words before inserting into the prompt. "
+             "0 (default) = no truncation (use full transcript).",
+    )
+
+    p.add_argument(
+        "--debias-cyclic-permutation",
+        action="store_true",
+        help="Position-debias multiple-choice predictions via cyclic option permutation. "
+             "Each option content is presented once at every label slot across N rotations "
+             "(N = number of options); the model's next-token option-label logprobs are read, "
+             "normalized per rotation, mapped back to each content, and averaged across rotations "
+             "to cancel the per-slot prior (e.g. the tendency to answer 'A'). Costs N forward "
+             "passes per question instead of one generate call. Only affects multiple_choice tasks.",
+    )
+    p.add_argument(
+        "--calibrate-prior",
+        action="store_true",
+        help="Prior-calibrated prediction (Zhao et al., 2021 — 'Calibrate Before Use'). "
+             "For each question, runs a second forward pass on a null prompt that keeps the "
+             "question and audio unchanged but replaces every option's text with an empty string. "
+             "The null pass reveals P(label | question, no_option_text) — the model's label-position "
+             "prior independent of option semantics. "
+             "Calibrated score = log P(label | real) - log P(label | null). "
+             "Costs exactly 2 forward passes per question regardless of N options. "
+             "Particularly effective for 2-option questions where cyclic debias only does 2 rotations. "
+             "Only affects multiple_choice tasks.",
+    )
+    p.add_argument(
+        "--yesno-binary",
+        action="store_true",
+        help="For 2-option questions, relabel options as '1'/'2' instead of 'A'/'B' in the "
+             "prompt and scoring. '1' maps to the first option (A), '2' to the second (B). "
+             "The output pred_choice is always remapped back to the canonical A/B label. "
+             "Addresses the MCQ-specific A-slot positional prior without introducing semantic "
+             "assumptions (unlike Yes/No). Only applies to jsonl_audio_mc tasks.",
+    )
+
     return p.parse_args()
 
 
@@ -1306,6 +2071,12 @@ def main() -> None:
     tasks = _parse_tasks(args.tasks)
     if "jsonl_audio_mc" in tasks and not args.jsonl_path:
         raise ValueError("--jsonl-path is required when --tasks includes jsonl_audio_mc")
+
+    prompt_prefix = (
+        f"lang:{args.prompt_language}\n[TRANSCRIBE]\n"
+        if args.use_transcription_hint_format
+        else ""
+    )
 
     dtype = _choose_dtype(use_bf16=bool(args.use_bf16), use_fp16=bool(args.use_fp16))
 
@@ -1322,7 +2093,7 @@ def main() -> None:
         adapter_path=args.adapter_path,
         dtype=dtype,
     )
-    processor = VoxtralProcessor.from_pretrained(args.model_id)
+    processor = VoxtralProcessor.from_pretrained(_resolve_pretrained_source(args.model_id))
 
     task_summaries: List[Dict] = []
     detailed_task_summaries: List[Dict] = []
@@ -1351,6 +2122,13 @@ def main() -> None:
                     max_new_tokens=int(args.max_new_tokens),
                     temp_audio_dir=temp_audio_dir,
                     prediction_only=bool(args.prediction_only),
+                    prompt_prefix=prompt_prefix,
+                    crop_from_question_refs=bool(args.eval_crop_from_question_refs),
+                    crop_collar_seconds=float(args.eval_crop_collar_seconds),
+                    random_crop_seconds=float(args.eval_random_crop_seconds),
+                    transcript_dir=args.transcript_dir,
+                    transcript_max_words=int(args.transcript_max_words),
+                    few_shot_count=int(args.few_shot_count),
                 )
                 fold_summaries.append(summary)
                 fold_rows.extend(rows)
@@ -1395,6 +2173,7 @@ def main() -> None:
                 audio_root=args.audio_root,
                 max_questions_per_audio=max(0, int(args.jsonl_max_questions_per_audio)),
                 prediction_only=bool(args.prediction_only),
+                yesno_binary=bool(args.yesno_binary),
             )
             print(
                 f"Starting task={task_data.task_name} split={task_data.split_name} "
@@ -1408,6 +2187,17 @@ def main() -> None:
                 max_new_tokens=int(args.max_new_tokens),
                 temp_audio_dir=temp_audio_dir,
                 prediction_only=bool(args.prediction_only),
+                prompt_prefix=prompt_prefix,
+                crop_from_question_refs=bool(args.eval_crop_from_question_refs),
+                crop_collar_seconds=float(args.eval_crop_collar_seconds),
+                random_crop_seconds=float(args.eval_random_crop_seconds),
+                transcript_dir=args.transcript_dir,
+                transcript_max_words=int(args.transcript_max_words),
+                debias_cyclic=bool(args.debias_cyclic_permutation),
+                calibrate_prior=bool(args.calibrate_prior),
+                few_shot_count=int(args.few_shot_count),
+                icl_multimodal=bool(args.icl_multimodal),
+                icl_multimodal_nonen=bool(args.icl_multimodal_nonen),
             )
             task_summaries.append(summary)
             detailed_task_summaries.append(summary)
@@ -1433,6 +2223,17 @@ def main() -> None:
             max_new_tokens=int(args.max_new_tokens),
             temp_audio_dir=temp_audio_dir,
             prediction_only=bool(args.prediction_only),
+            prompt_prefix=prompt_prefix,
+            crop_from_question_refs=bool(args.eval_crop_from_question_refs),
+            crop_collar_seconds=float(args.eval_crop_collar_seconds),
+            random_crop_seconds=float(args.eval_random_crop_seconds),
+            transcript_dir=args.transcript_dir,
+            transcript_max_words=int(args.transcript_max_words),
+            debias_cyclic=bool(args.debias_cyclic_permutation),
+            calibrate_prior=bool(args.calibrate_prior),
+            few_shot_count=int(args.few_shot_count),
+            icl_multimodal=bool(args.icl_multimodal),
+            icl_multimodal_nonen=bool(args.icl_multimodal_nonen),
         )
         task_summaries.append(summary)
         detailed_task_summaries.append(summary)
@@ -1481,6 +2282,28 @@ def main() -> None:
                 if not ans:
                     ans = "A"
                 f.write(f"{sid} {qid} {ans}\n")
+
+        # When cyclic debiasing is active, also emit an intermediate detail file
+        # carrying the SAME predictions completed with the per-permutation option
+        # logprobs (and the averaged content probabilities) for each question.
+        if bool(args.debias_cyclic_permutation):
+            detail_path = output_dir / "hyp_debias_detail.jsonl"
+            with detail_path.open("w", encoding="utf-8") as f:
+                for r in hyp_rows:
+                    sid = _normalize_submission_session_id(str(r.get("session_id") or ""))
+                    qid = str(r.get("question_id") or "")
+                    ans = _normalize_choice_label(str(r.get("pred_choice") or "")) or "A"
+                    content_probs = r.get("debias_content_probs") or {}
+                    detail = {
+                        "session_id": sid,
+                        "question_id": qid,
+                        "pred_choice": ans,
+                        "n_options": len(content_probs) or None,
+                        "content_probs": content_probs,
+                        "per_rotation_logprobs": r.get("debias_per_rotation"),
+                    }
+                    f.write(json.dumps(detail, ensure_ascii=False) + "\n")
+            print(f"Saved debias detail: {detail_path}")
 
     print("\nEvaluation complete.")
     print(f"Macro accuracy: {macro_acc:.4f}")
