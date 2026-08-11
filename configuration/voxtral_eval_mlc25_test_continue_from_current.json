@@ -1,0 +1,20 @@
+{
+  "source": "mlc",
+  "splits": ["test_clean"],
+  "checkpoint_path": "experiments/mlc25_mlc26_continue_from_current_4gpu_fixed_bothsides_20260530_120641/final_model",
+  "model_id": "mistralai/Voxtral-Mini-3B-2507",
+  "prompt_language": "en",
+  "decoding_language_mode": "fixed",
+  "scoring_mode": "normalization_both_sides",
+  "enable_mlc_language_name_mapping": true,
+  "eval_batch_size": 32,
+  "max_new_tokens": 256,
+  "dataloader_num_workers": 4,
+  "use_bf16": true,
+  "use_fp16": false,
+  "mlc_cache_dir": "data/cache/voxtral",
+  "mlc_test_cache_name": "mlc_slm_English_French_German_Italian_Japanese_Korean_Portuguese_Russian_Spanish_Thai_Vietnamese_tn",
+  "output_dir": "experiments/eval_results/mlc25_test_continue_from_current",
+  "timestamped_output": false,
+  "use_prepared_cache": false
+}

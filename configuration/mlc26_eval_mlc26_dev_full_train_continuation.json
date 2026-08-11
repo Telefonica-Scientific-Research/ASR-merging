@@ -1,0 +1,27 @@
+{
+  "source": "mlc",
+  "model_mode": "adapter",
+  "adapter_path": "experiments/mlc25_mlc26_continue_4gpu_fixed_bothsides_20260530_120641/final_model",
+
+  "do_eval": true,
+  "evaluation_set": "dev_clean",
+
+  "mlc_cache_dir": "data/cache/voxtral",
+  "mlc_train_dev_cache_names": [
+    "mlc_slm_zz_2026_new_only_segmented"
+  ],
+
+  "timestamped_exp_dir": true,
+  "output_root": "experiments",
+  "experiment_name": "mlc26_eval_mlc26_dev_full_train_continuation",
+  "tf_tracking": false,
+
+  "eval_batch_size": 24,
+  "max_new_tokens": 256,
+  "use_vad": true,
+  "model_id": "mistralai/Voxtral-Mini-3B-2507",
+  "prompt_language": "en",
+  "enable_mlc_language_name_mapping": true,
+  "eval_decoding_language_mode": "fixed",
+  "eval_scoring_mode": "normalization_both_sides"
+}
