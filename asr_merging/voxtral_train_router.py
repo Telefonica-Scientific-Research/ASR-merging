@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import inspect
 import json
 import math
@@ -39,12 +40,14 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import jiwer
 import numpy as np
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 import transformers
 from datasets import Audio, Dataset, concatenate_datasets, load_from_disk
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (
+    AutoProcessor,
     EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
@@ -176,6 +179,7 @@ class Config:
     mlc_cache_name: Optional[str] = None
     mlc_train_dev_cache_names: List[str] = field(default_factory=list)
     mlc_test_cache_name: Optional[str] = None
+    mlc_test_cache_names: List[str] = field(default_factory=list)
     adaptive_sampling_enabled: bool = False
     adaptive_sampling_languages: List[str] = field(default_factory=list)
     adaptive_sampling_multiplier: float = 1.5
@@ -237,6 +241,7 @@ def _default_cli_options() -> Dict:
         "mlc_cache_name": None,
         "mlc_train_dev_cache_names": [],
         "mlc_test_cache_name": None,
+        "mlc_test_cache_names": [],
         "adaptive_sampling_enabled": False,
         "adaptive_sampling_languages": [],
         "adaptive_sampling_multiplier": 1.5,
@@ -359,6 +364,7 @@ def _build_config_from_inputs(merged: Dict, cfg_values: Dict) -> Config:
             "mlc_cache_name": merged["mlc_cache_name"],
             "mlc_train_dev_cache_names": list(merged.get("mlc_train_dev_cache_names") or []),
             "mlc_test_cache_name": merged["mlc_test_cache_name"],
+            "mlc_test_cache_names": list(merged.get("mlc_test_cache_names") or []),
             "adaptive_sampling_enabled": merged["adaptive_sampling_enabled"],
             "adaptive_sampling_languages": list(merged.get("adaptive_sampling_languages") or []),
             "adaptive_sampling_multiplier": merged["adaptive_sampling_multiplier"],
@@ -433,6 +439,7 @@ class VoxtralCanonicalCollator:
         language_dropout_seed: int = 42,
         use_name_mapping: bool = True,
         language_field_candidates: Optional[List[str]] = None,
+        sample_rate: int = 16000,
     ):
         self.processor = processor
         self.model_id = model_id
@@ -441,6 +448,7 @@ class VoxtralCanonicalCollator:
         self.enable_per_sample_language_prompt = bool(enable_per_sample_language_prompt)
         self.language_dropout_fraction = float(language_dropout_fraction)
         self.use_name_mapping = bool(use_name_mapping)
+        self.sample_rate = int(sample_rate)
         self.language_field_candidates = tuple(language_field_candidates or LANGUAGE_FIELD_CANDIDATES_DEFAULT)
         self._rng = np.random.default_rng(int(language_dropout_seed))
 
@@ -452,6 +460,32 @@ class VoxtralCanonicalCollator:
             if key in feature and feature[key] is not None:
                 return _map_language_for_model(feature[key], use_name_mapping=self.use_name_mapping)
         return None
+
+    def _audio_to_array(self, audio_obj: dict) -> np.ndarray:
+        # Compatible with both decoded entries ({"array": ...}) and decode=False entries ({"path"/"bytes": ...}).
+        if isinstance(audio_obj, dict) and audio_obj.get("array") is not None:
+            arr = np.asarray(audio_obj["array"], dtype=np.float32)
+            src_sr = int(audio_obj.get("sampling_rate") or self.sample_rate)
+        else:
+            arr = None
+            src_sr = self.sample_rate
+            if isinstance(audio_obj, dict):
+                if audio_obj.get("bytes") is not None:
+                    arr, src_sr = sf.read(io.BytesIO(audio_obj["bytes"]), dtype="float32", always_2d=False)
+                elif audio_obj.get("path"):
+                    arr, src_sr = sf.read(audio_obj["path"], dtype="float32", always_2d=False)
+            if arr is None:
+                raise ValueError("Unsupported audio format in collator; expected array or {path/bytes}.")
+
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = np.mean(arr, axis=1, dtype=np.float32)
+        if src_sr != self.sample_rate and len(arr) > 0:
+            new_len = max(1, int(round(len(arr) * float(self.sample_rate) / float(src_sr))))
+            old_axis = np.linspace(0.0, 1.0, num=len(arr), dtype=np.float32)
+            new_axis = np.linspace(0.0, 1.0, num=new_len, dtype=np.float32)
+            arr = np.interp(new_axis, old_axis, arr).astype(np.float32)
+        return arr
 
     @staticmethod
     def _pad_and_cat_tensors(tensors: List[torch.Tensor]) -> torch.Tensor:
@@ -488,7 +522,7 @@ class VoxtralCanonicalCollator:
 
     def __call__(self, features: List[dict]) -> Dict[str, torch.Tensor]:
         texts = [f[self.text_key] for f in features]
-        audios = [f["audio"]["array"] for f in features]
+        audios = [self._audio_to_array(f["audio"]) for f in features]
 
         if self.enable_per_sample_language_prompt:
             prompts = []
@@ -503,6 +537,7 @@ class VoxtralCanonicalCollator:
                 req_kwargs = {
                     "model_id": self.model_id,
                     "audio": [audio],
+                    "sampling_rate": self.sample_rate,
                     "format": ["WAV"],
                     "return_tensors": "pt",
                 }
@@ -522,6 +557,7 @@ class VoxtralCanonicalCollator:
                 language=_map_language_for_model(self.language, use_name_mapping=self.use_name_mapping),
                 model_id=self.model_id,
                 audio=audios,
+                sampling_rate=self.sample_rate,
                 format=["WAV"] * len(audios),
                 return_tensors="pt",
             )
@@ -615,6 +651,33 @@ def create_vad_filtering_preprocessor(
             vad_fn = None
 
     def _preprocess(batch: dict) -> dict:
+        def _decode_audio_entry(a: dict) -> np.ndarray:
+            # Supports both decoded entries ({"array": ...}) and decode=False entries ({"path"/"bytes": ...}).
+            if isinstance(a, dict) and a.get("array") is not None:
+                arr = np.asarray(a["array"], dtype=np.float32)
+                src_sr = int(a.get("sampling_rate") or sampling_rate)
+            else:
+                arr = None
+                src_sr = sampling_rate
+                if isinstance(a, dict):
+                    if a.get("bytes") is not None:
+                        arr, src_sr = sf.read(io.BytesIO(a["bytes"]), dtype="float32", always_2d=False)
+                    elif a.get("path"):
+                        arr, src_sr = sf.read(a["path"], dtype="float32", always_2d=False)
+                if arr is None:
+                    raise ValueError("Unsupported audio entry format; expected decoded array or {path/bytes}.")
+
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim > 1:
+                arr = np.mean(arr, axis=1, dtype=np.float32)
+
+            if src_sr != sampling_rate and len(arr) > 0:
+                new_len = max(1, int(round(len(arr) * float(sampling_rate) / float(src_sr))))
+                old_axis = np.linspace(0.0, 1.0, num=len(arr), dtype=np.float32)
+                new_axis = np.linspace(0.0, 1.0, num=new_len, dtype=np.float32)
+                arr = np.interp(new_axis, old_axis, arr).astype(np.float32)
+            return arr
+
         out_audio: List[dict] = []
         out_text: List[str] = []
         out_language: List[Optional[str]] = []
@@ -628,7 +691,7 @@ def create_vad_filtering_preprocessor(
             langs = [langs] * len(audios)
 
         for idx, (a, t) in enumerate(zip(audios, texts)):
-            arr = np.asarray(a["array"], dtype=np.float32)
+            arr = _decode_audio_entry(a)
             if use_vad and vad_fn is not None:
                 kept = vad_fn(arr)
                 if kept is not None:
@@ -661,18 +724,79 @@ def build_voxtral_preprocessor(config: Config, processor: VoxtralProcessor) -> C
     )
 
 
-def load_voxtral_base_model(config: Config) -> VoxtralForConditionalGeneration:
+def _is_offline_mode_enabled() -> bool:
+    return str(os.environ.get("HF_HUB_OFFLINE", "")).strip().lower() in {"1", "true", "yes", "on"} or str(
+        os.environ.get("TRANSFORMERS_OFFLINE", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _offline_aware_from_pretrained_kwargs(extra: Optional[Dict] = None) -> Dict:
+    kwargs: Dict = {}
+    if _is_offline_mode_enabled():
+        kwargs["local_files_only"] = True
+    if extra:
+        kwargs.update(extra)
+    return kwargs
+
+
+def _resolve_local_snapshot_source(model_id: str) -> Optional[str]:
+    repo_dir_name = "models--" + model_id.replace("/", "--")
+    cache_candidates: List[Path] = []
+
+    hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+    transformers_cache = os.environ.get("TRANSFORMERS_CACHE")
+    hf_home = os.environ.get("HF_HOME")
+
+    if hf_hub_cache:
+        cache_candidates.append(Path(hf_hub_cache))
+    if transformers_cache:
+        cache_candidates.append(Path(transformers_cache))
+    if hf_home:
+        cache_candidates.append(Path(hf_home) / "hub")
+
+    # Keep order but deduplicate.
+    seen = set()
+    uniq_candidates = []
+    for c in cache_candidates:
+        key = str(c)
+        if key not in seen:
+            seen.add(key)
+            uniq_candidates.append(c)
+
+    for root in uniq_candidates:
+        repo_dir = root / repo_dir_name
+        snapshots_root = repo_dir / "snapshots"
+        if not snapshots_root.exists() or not snapshots_root.is_dir():
+            continue
+        snapshots = sorted([p for p in snapshots_root.iterdir() if p.is_dir()])
+        if snapshots:
+            return str(snapshots[-1])
+    return None
+
+
+def _resolve_pretrained_source(model_id: str) -> str:
+    if not _is_offline_mode_enabled():
+        return model_id
+    local_snapshot = _resolve_local_snapshot_source(model_id)
+    if local_snapshot:
+        print(f"[INFO] Offline mode: using local snapshot source {local_snapshot}", flush=True)
+        return local_snapshot
+    return model_id
+
+
+def load_voxtral_base_model(config: Config, model_source: Optional[str] = None) -> VoxtralForConditionalGeneration:
     dtype = torch.bfloat16 if config.use_bf16 else (torch.float16 if config.use_fp16 else torch.float32)
     # device_map='auto' breaks distributed training launched via torchrun/accelerate.
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     distributed = world_size > 1 or local_rank >= 0
 
-    load_kwargs = {"torch_dtype": dtype}
+    load_kwargs = _offline_aware_from_pretrained_kwargs({"torch_dtype": dtype})
     if not distributed:
         load_kwargs["device_map"] = "auto"
 
-    model = VoxtralForConditionalGeneration.from_pretrained(config.model_id, **load_kwargs)
+    source = model_source or config.model_id
+    model = VoxtralForConditionalGeneration.from_pretrained(source, **load_kwargs)
     if config.use_grad_checkpoint:
         model.gradient_checkpointing_enable()
     return model
@@ -700,6 +824,12 @@ def _ensure_canonical(ds: Dataset, split_name: str) -> Dataset:
     return ds
 
 
+def _force_audio_decode_false(ds: Dataset, sampling_rate: int) -> Dataset:
+    if "audio" in ds.column_names:
+        return ds.cast_column("audio", Audio(sampling_rate=sampling_rate, decode=False))
+    return ds
+
+
 def recover_vc_splits(config: Config, language: str) -> Dict[str, Tuple[Dataset, List[str]]]:
     root = config.processed_cv_cache_dir / language
     if not root.exists():
@@ -709,6 +839,7 @@ def recover_vc_splits(config: Config, language: str) -> Dict[str, Tuple[Dataset,
     split_map = {"train": "train", "valid": "valid", "test": "test"}
     for key, split_dir in split_map.items():
         ds = load_from_disk(str(root / split_dir))
+        ds = _force_audio_decode_false(ds, config.sample_rate)
         ds = _ensure_canonical(ds, key)
         refs_path = root / f"{split_dir}_refs.json"
         refs = json.loads(refs_path.read_text(encoding="utf-8")) if refs_path.exists() else list(ds["text"])
@@ -726,11 +857,12 @@ def recover_openslr_splits(config: Config) -> Dict[str, Tuple[Dataset, List[str]
         raise FileNotFoundError(f"No canonical Voxtral OpenSLR cache found under: {root}")
 
     ds = load_from_disk(str(candidates[0]))
+    ds = _force_audio_decode_false(ds, config.sample_rate)
     ds = _ensure_canonical(ds, "openslr_test")
     return {"test": (ds, list(ds["text"]))}
 
 
-def recover_mlc_splits(config: Config) -> Dict[str, Tuple[Dataset, List[str]]]:
+def recover_mlc_splits(config: Config, run_train: bool = True) -> Dict[str, Tuple[Dataset, List[str]]]:
     root = config.mlc_cache_dir
     if not root.exists():
         raise FileNotFoundError(f"MLC cache root not found: {root}")
@@ -752,27 +884,32 @@ def recover_mlc_splits(config: Config) -> Dict[str, Tuple[Dataset, List[str]]]:
     else:
         train_dev_dirs = [dirs[0]]
 
-    if config.mlc_test_cache_name:
-        test_dir = _resolve_cache_dir(config.mlc_test_cache_name)
+    if config.mlc_test_cache_names:
+        test_dirs = [_resolve_cache_dir(n) for n in config.mlc_test_cache_names]
+    elif config.mlc_test_cache_name:
+        test_dirs = [_resolve_cache_dir(config.mlc_test_cache_name)]
     elif config.mlc_cache_name:
-        test_dir = _resolve_cache_dir(config.mlc_cache_name)
+        test_dirs = [_resolve_cache_dir(config.mlc_cache_name)]
     else:
-        test_dir = train_dev_dirs[0]
+        test_dirs = [train_dev_dirs[0]]
 
-    def _load_one_cache(mlc: Path) -> Dict[str, Tuple[Dataset, List[str]]]:
-        split_proc = {sn: _ensure_canonical(load_from_disk(str(mlc / sn / "processed")), sn) for sn in ("train", "dev", "test")}
-        refs = {sn: list(split_proc[sn]["text"]) for sn in split_proc}
+    def _load_one_cache(mlc: Path, splits_to_load: Tuple[str, ...]) -> Dict[str, Tuple[Dataset, List[str]]]:
+        print(f"[MLC] Loading cache: {mlc.name} splits={list(splits_to_load)}", flush=True)
+        split_proc: Dict[str, Dataset] = {}
+        refs: Dict[str, List[str]] = {}
+        for sn in splits_to_load:
+            print(f"[MLC]   load split '{sn}' from {mlc / sn / 'processed'}", flush=True)
+            ds = _ensure_canonical(load_from_disk(str(mlc / sn / "processed")), sn)
+            ds = _force_audio_decode_false(ds, config.sample_rate)
+            split_proc[sn] = ds
+            refs[sn] = list(ds["text"])
 
-        one = {
-            "train": (split_proc["train"], refs["train"]),
-            "dev": (split_proc["dev"], refs["dev"]),
-            "test": (split_proc["test"], refs["test"]),
-        }
+        one = {sn: (split_proc[sn], refs[sn]) for sn in splits_to_load}
 
         clean_root = mlc / "clean_index_cache"
         if clean_root.exists():
             clean = {}
-            for sn in ("train", "dev", "test"):
+            for sn in split_proc.keys():
                 jp = clean_root / f"{sn}_clean_indices.json"
                 if jp.exists():
                     meta = json.loads(jp.read_text(encoding="utf-8"))
@@ -783,27 +920,35 @@ def recover_mlc_splits(config: Config) -> Dict[str, Tuple[Dataset, List[str]]]:
                 rsc = [refs[sn][i] for i in keep]
                 clean[sn] = (dsc, rsc)
 
-            one["train_clean"] = clean["train"]
-            one["dev_clean"] = clean["dev"]
-            one["test_clean"] = clean["test"]
+            if "train" in clean:
+                one["train_clean"] = clean["train"]
+            if "dev" in clean:
+                one["dev_clean"] = clean["dev"]
+            if "test" in clean:
+                one["test_clean"] = clean["test"]
 
-            subset_root = clean_root / "train_subset"
-            eval_j = subset_root / "train_eval_subset_indices.json"
-            finetune_j = subset_root / "train_finetune_indices.json"
-            if eval_j.exists() and finetune_j.exists():
-                train_clean_ds, train_clean_refs = clean["train"]
-                eval_idx = _normalize_indices(json.loads(eval_j.read_text(encoding="utf-8")).get("indices", []), len(train_clean_ds))
-                finetune_idx = _normalize_indices(
-                    json.loads(finetune_j.read_text(encoding="utf-8")).get("indices", []),
-                    len(train_clean_ds),
-                )
-                one["train_eval"] = (train_clean_ds.select(eval_idx), [train_clean_refs[i] for i in eval_idx])
-                one["train_finetune"] = (train_clean_ds.select(finetune_idx), [train_clean_refs[i] for i in finetune_idx])
+            if "train" in clean:
+                subset_root = clean_root / "train_subset"
+                eval_j = subset_root / "train_eval_subset_indices.json"
+                finetune_j = subset_root / "train_finetune_indices.json"
+                if eval_j.exists() and finetune_j.exists():
+                    train_clean_ds, train_clean_refs = clean["train"]
+                    eval_idx = _normalize_indices(json.loads(eval_j.read_text(encoding="utf-8")).get("indices", []), len(train_clean_ds))
+                    finetune_idx = _normalize_indices(
+                        json.loads(finetune_j.read_text(encoding="utf-8")).get("indices", []),
+                        len(train_clean_ds),
+                    )
+                    one["train_eval"] = (train_clean_ds.select(eval_idx), [train_clean_refs[i] for i in eval_idx])
+                    one["train_finetune"] = (train_clean_ds.select(finetune_idx), [train_clean_refs[i] for i in finetune_idx])
 
         return one
 
-    train_dev_loaded = [_load_one_cache(d) for d in train_dev_dirs]
-    test_loaded = _load_one_cache(test_dir)
+    # Avoid reading unnecessary shards:
+    # - train/dev caches: skip train split entirely when not training
+    # - test cache is only used for test (+test_clean)
+    train_dev_splits = ("train", "dev") if run_train else ("dev",)
+    train_dev_loaded = [_load_one_cache(d, train_dev_splits) for d in train_dev_dirs]
+    test_loaded_list = [_load_one_cache(d, ("test",)) for d in test_dirs]
 
     def _concat_entries(entries: List[Tuple[Dataset, List[str]]], split_name: str) -> Tuple[Dataset, List[str]]:
         if not entries:
@@ -816,30 +961,32 @@ def recover_mlc_splits(config: Config) -> Dict[str, Tuple[Dataset, List[str]]]:
             refs.extend(r)
         return _ensure_canonical(concatenate_datasets(dsets), split_name), refs
 
-    out = {
-        "train": _concat_entries([x["train"] for x in train_dev_loaded], "train"),
-        "dev": _concat_entries([x["dev"] for x in train_dev_loaded], "dev"),
-        "test": test_loaded["test"],
-    }
+    out: Dict[str, Tuple[Dataset, List[str]]] = {}
+    if run_train:
+        out["train"] = _concat_entries([x["train"] for x in train_dev_loaded], "train")
+    out["dev"] = _concat_entries([x["dev"] for x in train_dev_loaded], "dev")
+    out["test"] = _concat_entries([x["test"] for x in test_loaded_list], "test")
 
-    train_clean_entries = [x.get("train_clean", x["train"]) for x in train_dev_loaded]
+    if run_train:
+        train_clean_entries = [x.get("train_clean", x["train"]) for x in train_dev_loaded]
+        out["train_clean"] = _concat_entries(train_clean_entries, "train_clean")
     dev_clean_entries = [x.get("dev_clean", x["dev"]) for x in train_dev_loaded]
-    test_clean_entry = test_loaded.get("test_clean", test_loaded["test"])
-    out["train_clean"] = _concat_entries(train_clean_entries, "train_clean")
+    test_clean_entries = [x.get("test_clean", x["test"]) for x in test_loaded_list]
     out["dev_clean"] = _concat_entries(dev_clean_entries, "dev_clean")
-    out["test_clean"] = test_clean_entry
+    out["test_clean"] = _concat_entries(test_clean_entries, "test_clean")
 
-    train_eval_entries = [x["train_eval"] for x in train_dev_loaded if "train_eval" in x]
-    if train_eval_entries:
-        out["train_eval"] = _concat_entries(train_eval_entries, "train_eval")
-    train_finetune_entries = [x["train_finetune"] for x in train_dev_loaded if "train_finetune" in x]
-    if train_finetune_entries:
-        out["train_finetune"] = _concat_entries(train_finetune_entries, "train_finetune")
+    if run_train:
+        train_eval_entries = [x["train_eval"] for x in train_dev_loaded if "train_eval" in x]
+        if train_eval_entries:
+            out["train_eval"] = _concat_entries(train_eval_entries, "train_eval")
+        train_finetune_entries = [x["train_finetune"] for x in train_dev_loaded if "train_finetune" in x]
+        if train_finetune_entries:
+            out["train_finetune"] = _concat_entries(train_finetune_entries, "train_finetune")
 
     return out
 
 
-def recover_dataset_pool(config: Config, source: str, language: Optional[str]) -> Dict[str, Tuple[Dataset, List[str]]]:
+def recover_dataset_pool(config: Config, source: str, language: Optional[str], run_train: bool = True) -> Dict[str, Tuple[Dataset, List[str]]]:
     source = source.lower()
     if source == "vc":
         if not language:
@@ -848,7 +995,7 @@ def recover_dataset_pool(config: Config, source: str, language: Optional[str]) -
     if source == "openslr":
         return recover_openslr_splits(config)
     if source == "mlc":
-        return recover_mlc_splits(config)
+        return recover_mlc_splits(config, run_train=run_train)
     raise ValueError(f"Unsupported source: {source}")
 
 
@@ -1065,14 +1212,16 @@ def _materialize_audio_path(audio_obj, temp_audio_dir: Path, sample_id: str) -> 
     raise RuntimeError(f"Could not materialize audio for sample_id={sample_id}")
 
 
-def _build_voxtral_chat_input_features(processor: VoxtralProcessor, chat_audio: List[np.ndarray]) -> torch.Tensor:
+def _build_voxtral_chat_input_features(
+    processor: VoxtralProcessor, chat_audio: List[np.ndarray], sampling_rate: int
+) -> torch.Tensor:
     """Build input features for Voxtral from chat audio without using _retrieve_input_features."""
     feature_tensors = []
     for audio_array in chat_audio:
         # Use feature extractor to get raw features
         audio_inputs = processor.feature_extractor(
             audio_array,
-            sampling_rate=16000,
+            sampling_rate=sampling_rate,
             padding=False,
             truncation=False,
         )
@@ -1119,6 +1268,7 @@ def canonical_generate_predictions(
     decoding_language_mode: str = "fixed",
     use_name_mapping: bool = True,
     sample_languages: Optional[List[Optional[str]]] = None,
+    sample_rate: int = 16000,
 ) -> List[str]:
     model.eval()
     preds: List[str] = []
@@ -1129,7 +1279,30 @@ def canonical_generate_predictions(
             end = min(start + batch_size, len(dataset))
             batch = dataset.select(range(start, end))
             audio_objs = list(batch["audio"])
-            audios = [x["array"] for x in audio_objs]
+            audios = []
+            for x in audio_objs:
+                if isinstance(x, dict) and x.get("array") is not None:
+                    arr = np.asarray(x["array"], dtype=np.float32)
+                    src_sr = int(x.get("sampling_rate") or sample_rate)
+                else:
+                    arr = None
+                    src_sr = sample_rate
+                    if isinstance(x, dict):
+                        if x.get("bytes") is not None:
+                            arr, src_sr = sf.read(io.BytesIO(x["bytes"]), dtype="float32", always_2d=False)
+                        elif x.get("path"):
+                            arr, src_sr = sf.read(x["path"], dtype="float32", always_2d=False)
+                if arr is None:
+                    raise RuntimeError("Unsupported evaluation audio format; expected array or {path/bytes}.")
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.ndim > 1:
+                    arr = np.mean(arr, axis=1, dtype=np.float32)
+                if src_sr != sample_rate and len(arr) > 0:
+                    new_len = max(1, int(round(len(arr) * float(sample_rate) / float(src_sr))))
+                    old_axis = np.linspace(0.0, 1.0, num=len(arr), dtype=np.float32)
+                    new_axis = np.linspace(0.0, 1.0, num=new_len, dtype=np.float32)
+                    arr = np.interp(new_axis, old_axis, arr).astype(np.float32)
+                audios.append(arr)
 
             def _decode_subset(sub_audios: List, lang_value: Optional[str]) -> List[str]:
                 nonlocal warned_autodetect_fallback
@@ -1154,6 +1327,7 @@ def canonical_generate_predictions(
                     "model_id": model_id,
                     "language": req_language,
                     "audio": sub_audios,
+                    "sampling_rate": sample_rate,
                     "format": ["WAV"] * len(sub_audios),
                     "return_tensors": "pt",
                 }
@@ -1192,7 +1366,7 @@ def canonical_generate_predictions(
                 inputs = {
                     "input_ids": torch.tensor(encoded["input_ids"], dtype=torch.long),
                     "attention_mask": torch.tensor(encoded["attention_mask"], dtype=torch.long),
-                    "input_features": _build_voxtral_chat_input_features(processor, chat_audio),
+                    "input_features": _build_voxtral_chat_input_features(processor, chat_audio, sample_rate),
                 }
                 inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
                 prompt_len = inputs["input_ids"].shape[1]
@@ -1309,6 +1483,7 @@ def _build_canonical_collator(config: Config, processor: VoxtralProcessor) -> Vo
         processor=processor,
         model_id=config.model_id,
         language=config.prompt_language,
+        sample_rate=config.sample_rate,
         text_key="text",
         enable_per_sample_language_prompt=config.enable_per_sample_language_prompt,
         language_dropout_fraction=config.language_dropout_fraction,
@@ -1585,6 +1760,11 @@ def parse_args() -> argparse.Namespace:
         "--mlc-test-cache-name",
         help="Optional mlc_slm_* cache folder name to use only for test/test_clean.",
     )
+    p.add_argument(
+        "--mlc-test-cache-names",
+        nargs="+",
+        help="Optional list of mlc_slm_* cache folder names to concatenate for test/test_clean (overrides --mlc-test-cache-name).",
+    )
     p.add_argument("--adaptive-sampling-enabled", action="store_true", help="Enable two-stage language upsampling for early training steps.")
     p.add_argument(
         "--adaptive-sampling-languages",
@@ -1618,7 +1798,7 @@ def main() -> None:
 
     config = _build_config_from_inputs(merged=merged, cfg_values=cfg_values)
 
-    pool = recover_dataset_pool(config=config, source=merged["source"], language=merged["language"])
+    pool = recover_dataset_pool(config=config, source=merged["source"], language=merged["language"], run_train=run_train)
 
     print("Recovered dataset splits:")
     for name, (ds, _) in sorted(pool.items()):
@@ -1719,7 +1899,64 @@ def main() -> None:
         tracked_cfg = output_dir / "input_config.json"
         tracked_cfg.write_text(json.dumps(raw_cfg, indent=2), encoding="utf-8")
 
-    processor = VoxtralProcessor.from_pretrained(config.model_id)
+    pretrained_source = _resolve_pretrained_source(config.model_id)
+
+    processor = None
+    tokenizer_init_errors: List[str] = []
+
+    try:
+        processor = VoxtralProcessor.from_pretrained(
+            pretrained_source,
+            **_offline_aware_from_pretrained_kwargs(),
+        )
+    except Exception as e:
+        tokenizer_init_errors.append(f"VoxtralProcessor fast init failed: {e}")
+        print(
+            "[WARN] Fast tokenizer initialization failed; retrying with use_fast=False.",
+            flush=True,
+        )
+
+    if processor is None:
+        try:
+            processor = VoxtralProcessor.from_pretrained(
+                pretrained_source,
+                **_offline_aware_from_pretrained_kwargs({"use_fast": False}),
+            )
+        except Exception as e:
+            tokenizer_init_errors.append(f"VoxtralProcessor slow init failed: {e}")
+            print(
+                "[WARN] VoxtralProcessor slow init failed; retrying via AutoProcessor(trust_remote_code=True).",
+                flush=True,
+            )
+
+    if processor is None:
+        try:
+            processor = AutoProcessor.from_pretrained(
+                pretrained_source,
+                trust_remote_code=True,
+                **_offline_aware_from_pretrained_kwargs({"use_fast": False}),
+            )
+        except Exception as e:
+            tokenizer_init_errors.append(f"AutoProcessor fallback failed: {e}")
+
+    if processor is None:
+        joined = "\n".join(tokenizer_init_errors)
+        raise RuntimeError(
+            "Tokenizer initialization failed for model "
+            f"{config.model_id}. Ensure tokenizer backends are installed in the active "
+            "environment (sentencepiece, tiktoken, tokenizers, blobfile, mistral-common).\n"
+            f"Details:\n{joined}"
+        )
+
+    tokenizer_obj = getattr(processor, "tokenizer", None)
+    tokenizer_is_fast = getattr(tokenizer_obj, "is_fast", None)
+    if tokenizer_is_fast is True:
+        tokenizer_mode = "fast"
+    elif tokenizer_is_fast is False:
+        tokenizer_mode = "slow"
+    else:
+        tokenizer_mode = "unknown"
+    print(f"Tokenizer mode: {tokenizer_mode}", flush=True)
 
     active_model = None
     trainer = None
@@ -1744,10 +1981,10 @@ def main() -> None:
             print(f"Resuming from checkpoint: {resume_ckpt_path} (hint={resume_stage_hint})")
 
         if merged["model_mode"] == "adapter" and merged["adapter_path"]:
-            base = load_voxtral_base_model(config)
+            base = load_voxtral_base_model(config, model_source=pretrained_source)
             active_model = PeftModel.from_pretrained(base, merged["adapter_path"], is_trainable=True)
         else:
-            base = load_voxtral_base_model(config)
+            base = load_voxtral_base_model(config, model_source=pretrained_source)
             if hasattr(base, "audio_tower"):
                 for p_ in base.audio_tower.parameters():
                     p_.requires_grad = False
@@ -1864,7 +2101,7 @@ def main() -> None:
             raise ValueError(f"Evaluation split not found: {eval_set_name}")
 
         if active_model is None:
-            base = load_voxtral_base_model(config)
+            base = load_voxtral_base_model(config, model_source=pretrained_source)
             if merged["model_mode"] == "adapter":
                 if not merged["adapter_path"]:
                     raise ValueError("--adapter-path is required for --model-mode adapter when evaluating without training")
@@ -1905,6 +2142,7 @@ def main() -> None:
             batch_size=config.eval_batch_size,
             max_new_tokens=merged["max_new_tokens"],
             sample_languages=sample_languages_display,
+            sample_rate=config.sample_rate,
         )
 
         if eval_scoring_mode == "legacy":

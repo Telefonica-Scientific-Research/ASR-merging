@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import argparse
 import collections
+import io
 import json
 import re
 import shutil
+import soundfile as sf
 import tempfile
 import time
 import unicodedata
@@ -44,6 +46,8 @@ from .voxtral_train_router import (
     Config,
     load_voxtral_base_model,
     recover_dataset_pool,
+    _resolve_pretrained_source,
+    _force_audio_decode_false,
 )
 
 try:
@@ -764,9 +768,20 @@ def _generate_predictions_with_progress(
     try:
         for start in pbar:
             end = min(start + batch_size, total)
-            batch = dataset.select(range(start, end))
+            batch = _force_audio_decode_false(dataset.select(range(start, end)), 16000)
             audio_objs = list(batch["audio"])
-            audios = [x["array"] for x in audio_objs]
+            audios = []
+            for x in audio_objs:
+                if x.get("array") is not None:
+                    audios.append(np.asarray(x["array"], dtype=np.float32))
+                elif x.get("bytes") is not None:
+                    arr, _ = sf.read(io.BytesIO(x["bytes"]), dtype="float32", always_2d=False)
+                    audios.append(arr)
+                elif x.get("path"):
+                    arr, _ = sf.read(x["path"], dtype="float32", always_2d=False)
+                    audios.append(arr)
+                else:
+                    raise ValueError(f"Cannot decode audio entry: {list(x.keys()) if hasattr(x, 'keys') else type(x)}")
 
             batch_preds: List[Optional[str]] = [None] * len(audios)
 
@@ -912,14 +927,14 @@ def main() -> None:
     if all_cached and not merged.get("prepare_cache") and not merged.get("prepare_cache_only"):
         print(f"Using prepared eval cache from: {cache_dir}")
     else:
-        pool = recover_dataset_pool(config=cfg, source=merged["source"], language=merged["language"])
+        pool = recover_dataset_pool(config=cfg, source=merged["source"], language=merged["language"], run_train=False)
         print("Recovered dataset splits:")
         for split_name, (ds, _) in sorted(pool.items()):
             print(f"  - {split_name}: n={len(ds):,} cols={ds.column_names}")
 
     if merged.get("prepare_cache") or merged.get("prepare_cache_only"):
         if pool is None:
-            pool = recover_dataset_pool(config=cfg, source=merged["source"], language=merged["language"])
+            pool = recover_dataset_pool(config=cfg, source=merged["source"], language=merged["language"], run_train=False)
         cache_dir.mkdir(parents=True, exist_ok=True)
         for split_name in splits:
             if split_name not in pool:
@@ -950,7 +965,7 @@ def main() -> None:
         model_mode = "adapter"
         resolved_checkpoint = str(adapter_path)
 
-    processor = VoxtralProcessor.from_pretrained(cfg.model_id)
+    processor = VoxtralProcessor.from_pretrained(_resolve_pretrained_source(cfg.model_id))
 
     decoding_mode = str(merged.get("decoding_language_mode", "fixed")).strip().lower()
     scoring_mode = str(merged.get("scoring_mode", "normalization")).strip().lower()
@@ -979,7 +994,7 @@ def main() -> None:
             chunks = cached_chunks
         else:
             if pool is None:
-                pool = recover_dataset_pool(config=cfg, source=merged["source"], language=merged["language"])
+                pool = recover_dataset_pool(config=cfg, source=merged["source"], language=merged["language"], run_train=False)
             if split_name not in pool:
                 raise ValueError(
                     f"Requested split '{split_name}' not found for source={merged['source']}. "
